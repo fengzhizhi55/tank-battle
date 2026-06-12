@@ -1,747 +1,1764 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>手势追踪 · 幻彩粒子</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: #0a0a12;
-    overflow: hidden;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    width: 100vw; height: 100vh;
-  }
-  canvas {
-    display: block;
-    width: 100vw;
-    height: 100vh;
-    object-fit: cover;
-  }
-  video { display: none; }
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚔️</text></svg>"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
+    />
+    <title>大庚剑阵 (Standalone)</title>
 
-  #loading {
-    position: fixed; inset: 0; z-index: 100;
-    background: #0a0a12;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    color: #fff;
-    transition: opacity 0.8s;
-  }
-  #loading.hidden { opacity: 0; pointer-events: none; }
-  .spinner {
-    width: 48px; height: 48px;
-    border: 3px solid rgba(255,255,255,0.1);
-    border-top-color: #ff6b6b;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-bottom: 20px;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  #loading p { font-size: 15px; color: rgba(255,255,255,0.6); }
-  #loading .sub { font-size: 12px; color: rgba(255,255,255,0.3); margin-top: 8px; }
-  #loading .error-msg { font-size: 14px; color: #ff6b6b; margin-top: 12px; display: none; max-width: 320px; text-align: center; line-height: 1.5; }
+    <!-- Babel for in-browser JSX compilation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  #tip {
-    position: fixed; bottom: 28px; left: 50%; z-index: 50;
-    transform: translateX(-50%);
-    color: rgba(255,255,255,0.35); font-size: 13px;
-    text-align: center; pointer-events: none;
-    text-shadow: 0 2px 12px rgba(0,0,0,0.8);
-    transition: opacity 2s;
-  }
-
-  #retryBtn {
-    display: none; margin-top: 16px;
-    padding: 10px 28px; border-radius: 24px;
-    background: rgba(255,255,255,0.1); color: #fff;
-    border: 1px solid rgba(255,255,255,0.2);
-    font-size: 14px; cursor: pointer;
-    transition: background 0.2s;
-  }
-  #retryBtn:hover { background: rgba(255,255,255,0.2); }
-
-  #fpsDisplay {
-    position: fixed; top: 16px; left: 16px; z-index: 50;
-    font-family: monospace; font-size: 11px;
-    color: rgba(255,255,255,0.2);
-    pointer-events: none;
-  }
-</style>
-</head>
-<body>
-
-<div id="loading">
-  <div class="spinner"></div>
-  <p id="statusText">正在加载手势识别模型...</p>
-  <div class="sub">首次加载约 15MB · 请耐心等待</div>
-  <div class="error-msg" id="errorMsg"></div>
-  <button id="retryBtn">重试</button>
-</div>
-
-<div id="tip">✋ 张开 · ✊ 握拳 · ☝️ 食指 · ✌️ 剪刀 · 🤟 爱 · 🖖 四</div>
-<div id="fpsDisplay"></div>
-
-<video id="video" autoplay playsinline></video>
-<canvas id="canvas"></canvas>
-
-<script type="module">
-import { HandLandmarker, FilesetResolver } from
-  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm';
-
-// ---- DOM ----
-const video = document.getElementById('video');
-const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d');
-const loadingEl = document.getElementById('loading');
-const statusText = document.getElementById('statusText');
-const errorMsg = document.getElementById('errorMsg');
-const retryBtn = document.getElementById('retryBtn');
-const fpsDisplay = document.getElementById('fpsDisplay');
-const tipEl = document.getElementById('tip');
-
-// ---- 尺寸 ----
-let W, H;
-function resize() {
-  W = window.innerWidth;
-  H = window.innerHeight;
-  canvas.width = W;
-  canvas.height = H;
-}
-resize();
-window.addEventListener('resize', resize);
-
-// ---- 常量 ----
-const FINGERTIPS = [4, 8, 12, 16, 20];
-const FINGER_COLORS = [
-  [255, 80, 80],   // 拇指 红
-  [255, 210, 50],  // 食指 金
-  [80, 220, 120],  // 中指 绿
-  [50, 150, 255],  // 无名指 蓝
-  [180, 80, 255],  // 小指 紫
-];
-const HAND_CONNECTIONS = [
-  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
-  [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
-  [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
-];
-
-// ============ 镜像坐标转换 ============
-// 摄像头画面是镜像显示（像照镜子），MediaPipe 返回的是原始坐标
-// 所以 x 坐标需要翻转：mirroredX = 1 - originalX
-function lx(lm, i) { return (1 - lm[i].x) * W; }
-function ly(lm, i) { return lm[i].y * H; }
-
-// ---- 状态 ----
-let handLandmarker = null;
-let gesture = '';
-let prevGesture = '';
-let activeHandCount = 0;
-let lastVideoTime = -1;
-let timeAcc = 0;
-
-// ---- 背景星星 ----
-class Star {
-  constructor() { this.reset(true); }
-  reset(init = false) {
-    this.x = Math.random() * W;
-    this.y = Math.random() * H;
-    this.size = 0.5 + Math.random() * 1.5;
-    this.speed = 0.1 + Math.random() * 0.3;
-    this.alpha = 0.2 + Math.random() * 0.5;
-    this.phase = Math.random() * Math.PI * 2;
-    if (!init) this.y = -2;
-  }
-  update() {
-    this.y += this.speed;
-    if (this.y > H + 2) this.reset();
-  }
-  draw(ctx, time) {
-    const flicker = this.alpha * (0.6 + 0.4 * Math.sin(time * 0.02 + this.phase));
-    ctx.save();
-    ctx.globalAlpha = flicker;
-    ctx.beginPath();
-    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
-    ctx.fillStyle = '#fff';
-    ctx.fill();
-    ctx.restore();
-  }
-}
-
-const stars = Array.from({ length: 80 }, () => new Star());
-
-// ---- 背景光晕 ----
-let bgHue = 220;
-function drawBackground(gestureColor) {
-  // 深色渐变背景
-  const grad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W, H) * 0.8);
-  grad.addColorStop(0, '#12121f');
-  grad.addColorStop(1, '#080814');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, W, H);
-
-  // 星星
-  for (const s of stars) { s.update(); s.draw(ctx, timeAcc); }
-
-  // 手势色背景辉光（动态）
-  if (gestureColor) {
-    const [r, g, b] = gestureColor;
-    const cx = W/2 + Math.sin(timeAcc * 0.003) * W * 0.2;
-    const cy = H/2 + Math.cos(timeAcc * 0.004) * H * 0.15;
-    const glow = ctx.createRadialGradient(cx, cy, 20, cx, cy, Math.max(W, H) * 0.45);
-    glow.addColorStop(0, `rgba(${r},${g},${b},0.06)`);
-    glow.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = glow;
-    ctx.fillRect(0, 0, W, H);
-  }
-
-  // 边缘光晕
-  const edgePhase = Math.sin(timeAcc * 0.01) * 0.5 + 0.5;
-  const eg = ctx.createRadialGradient(W/2, H/2, Math.max(W, H) * 0.25, W/2, H/2, Math.max(W, H) * 0.55);
-  eg.addColorStop(0, 'rgba(0,0,0,0)');
-  eg.addColorStop(1, `rgba(30, 40, 80, ${0.1 + edgePhase * 0.08})`);
-  ctx.fillStyle = eg;
-  ctx.fillRect(0, 0, W, H);
-}
-
-// ---- 粒子系统（重写，更华丽） ----
-class Particle {
-  constructor(x, y, color, opts = {}) {
-    this.x = x; this.y = y;
-    const angle = opts.angle !== undefined ? opts.angle : -Math.PI/2 + (Math.random() - 0.5) * (opts.spread || 1.2);
-    const speed = opts.speed !== undefined ? opts.speed : 1 + Math.random() * 4;
-    this.vx = Math.cos(angle) * speed;
-    this.vy = Math.sin(angle) * speed;
-    this.life = 1;
-    this.maxLife = opts.maxLife !== undefined ? opts.maxLife : 0.8 + Math.random() * 1.8;
-    this.size = opts.size !== undefined ? opts.size : 1.5 + Math.random() * 5;
-    this.color = color;
-    this.gravity = opts.gravity !== undefined ? opts.gravity : 0.005;
-    this.friction = opts.friction !== undefined ? opts.friction : 0.97;
-    this.trail = []; // 轨迹
-    this.trailLen = opts.trailLen || 0;
-    this.glowMult = opts.glowMult !== undefined ? opts.glowMult : 1;
-    this.shape = opts.shape || 'circle'; // circle | star
-  }
-  update(dt) {
-    if (this.trailLen > 0) {
-      this.trail.push({ x: this.x, y: this.y });
-      if (this.trail.length > this.trailLen) this.trail.shift();
-    }
-    this.life -= dt / (this.maxLife * 60);
-    this.vx *= this.friction;
-    this.vy *= this.friction;
-    this.vy += this.gravity;
-    this.x += this.vx * dt;
-    this.y += this.vy * dt;
-  }
-  get alive() { return this.life > 0; }
-  get alpha() { return Math.min(1, this.life * 2.5); }
-  get currentSize() { return this.size * Math.min(1, this.life * 2); }
-}
-
-class ParticleSystem {
-  constructor() {
-    this.particles = [];
-  }
-  emit(x, y, color, count = 3, spread = 1.0, opts = {}) {
-    for (let i = 0; i < count; i++) {
-      this.particles.push(new Particle(x, y, color, { ...opts, spread }));
-    }
-  }
-  burst(x, y, color, count = 30, power = 7, opts = {}) {
-    for (let i = 0; i < count; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 1 + Math.random() * power;
-      this.particles.push(new Particle(x, y, color, {
-        ...opts, angle, speed: speed,
-        maxLife: 0.6 + Math.random() * 1.0,
-        friction: 0.96,
-      }));
-    }
-  }
-  implode(x, y, color, count = 25) {
-    for (let i = 0; i < count; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 0.5 + Math.random() * 2;
-      this.particles.push(new Particle(x, y, color, {
-        angle, speed: speed,
-        vx: Math.cos(angle) * speed * -0.8,
-        vy: Math.sin(angle) * speed * -0.8,
-        maxLife: 1.2 + Math.random() * 1.2,
-        friction: 0.90, gravity: 0.002,
-        glowMult: 1.5,
-      }));
-    }
-  }
-  ring(x, y, color, count = 24) {
-    for (let i = 0; i < count; i++) {
-      const angle = (i / count) * Math.PI * 2;
-      const speed = 2 + Math.random() * 1.5;
-      this.particles.push(new Particle(x, y, color, {
-        angle, speed,
-        maxLife: 0.5 + Math.random() * 0.3,
-        friction: 0.98, gravity: 0,
-        size: 2 + Math.random() * 3,
-        glowMult: 2,
-      }));
-    }
-  }
-  spiral(x, y, color, count = 36) {
-    for (let i = 0; i < count; i++) {
-      const t = i / count;
-      const angle = t * Math.PI * 4;
-      const speed = 1 + t * 4;
-      this.particles.push(new Particle(x, y, color, {
-        angle, speed,
-        maxLife: 0.6 + t * 0.6,
-        friction: 0.97, gravity: 0,
-        size: 2 + t * 3,
-        glowMult: 1.5 + t,
-      }));
-    }
-  }
-  update(dt) {
-    for (let i = this.particles.length - 1; i >= 0; i--) {
-      this.particles[i].update(dt);
-      if (!this.particles[i].alive) this.particles.splice(i, 1);
-    }
-    if (this.particles.length > 4000) {
-      this.particles.splice(0, this.particles.length - 4000);
-    }
-  }
-  draw(ctx) {
-    // 先画轨迹
-    for (const p of this.particles) {
-      if (p.trail.length < 2) continue;
-      const [r, g, b] = p.color;
-      ctx.save();
-      ctx.globalAlpha = p.alpha * 0.2;
-      ctx.shadowColor = `rgb(${r},${g},${b})`;
-      ctx.shadowBlur = 8;
-      ctx.strokeStyle = `rgba(${r},${g},${b},${p.alpha * 0.3})`;
-      ctx.lineWidth = p.size * 0.3;
-      ctx.beginPath();
-      ctx.moveTo(p.trail[0].x, p.trail[0].y);
-      for (let k = 1; k < p.trail.length; k++) {
-        ctx.lineTo(p.trail[k].x, p.trail[k].y);
+    <!-- Import Maps for dependencies -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@18.2.0",
+          "react/jsx-runtime": "https://esm.sh/react@18.2.0/jsx-runtime",
+          "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+          "three": "https://esm.sh/three@0.160.0",
+          "three/examples/jsm/utils/BufferGeometryUtils.js": "https://esm.sh/three@0.160.0/examples/jsm/utils/BufferGeometryUtils.js",
+          "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.12?external=react,react-dom,three",
+          "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.16.0?external=react,react-dom,three,@react-three/fiber",
+          "postprocessing": "https://esm.sh/postprocessing@6.34.1?external=three",
+          "zustand": "https://esm.sh/zustand@4.4.7?external=react",
+          "@mediapipe/tasks-vision": "https://esm.sh/@mediapipe/tasks-vision@0.10.18?bundle"
+        }
       }
-      ctx.stroke();
-      ctx.restore();
-    }
+    </script>
 
-    // 再画粒子
-    for (const p of this.particles) {
-      const alpha = p.alpha;
-      const size = p.currentSize;
-      if (alpha < 0.01 || size < 0.1) continue;
-      const [r, g, b] = p.color;
+    <style>
+      /* index.css */
+      :root {
+        font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+        line-height: 1.5;
+        font-weight: 400;
 
-      // 外发光层
-      ctx.save();
-      ctx.globalAlpha = alpha * 0.3 * p.glowMult;
-      ctx.shadowColor = `rgb(${r},${g},${b})`;
-      ctx.shadowBlur = size * 6 * p.glowMult;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, size * 0.7, 0, Math.PI * 2);
-      ctx.fillStyle = `rgb(${r},${g},${b})`;
-      ctx.fill();
-      ctx.restore();
+        color-scheme: light dark;
+        color: rgba(255, 255, 255, 0.87);
+        background-color: #242424;
 
-      // 核心
-      ctx.save();
-      ctx.globalAlpha = alpha * 0.9;
-      ctx.shadowColor = `rgb(${r},${g},${b})`;
-      ctx.shadowBlur = size * 4;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, size * 0.45, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(255,255,255,${alpha * 0.85})`;
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-}
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
 
-const particles = new ParticleSystem();
+      body {
+        margin: 0;
+        display: flex;
+        place-items: center;
+        min-width: 320px;
+        min-height: 100vh;
+        background-color: #000;
+        overflow: hidden;
+      }
 
-// ---- 指尖拖尾系统 ----
-class TrailPoint {
-  constructor(x, y, color) {
-    this.x = x; this.y = y; this.color = color;
-    this.life = 1;
-  }
-}
+      #root {
+        width: 100vw;
+        height: 100vh;
+      }
 
-let fingertipTrails = {};
+      /* App.css */
+      #root {
+        width: 100%;
+        height: 100vh;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        position: relative;
+      }
 
-function updateFingertipTrails(lm) {
-  const now = performance.now();
-  for (let f = 0; f < FINGERTIPS.length; f++) {
-    const idx = FINGERTIPS[f];
-    const x = lx(lm, idx);
-    const y = ly(lm, idx);
-    const key = f;
-    if (!fingertipTrails[key]) fingertipTrails[key] = [];
-    fingertipTrails[key].unshift({ x, y, life: 1, color: FINGER_COLORS[f] });
-    if (fingertipTrails[key].length > 12) fingertipTrails[key].pop();
-  }
-}
+      /* Disable selection */
+      canvas {
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
 
-function drawFingertipTrails(ctx) {
-  for (const key in fingertipTrails) {
-    const trail = fingertipTrails[key];
-    if (trail.length < 2) continue;
-    const [r, g, b] = trail[0].color;
-    for (let i = 0; i < trail.length - 1; i++) {
-      const p = trail[i];
-      const alpha = (1 - i / trail.length) * 0.5;
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.shadowColor = `rgb(${r},${g},${b})`;
-      ctx.shadowBlur = 15;
-      ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
-      ctx.lineWidth = 3 - (i / trail.length) * 2.5;
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(trail[i+1].x, trail[i+1].y);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-}
+    <script type="text/babel" data-type="module">
+      import React, { useState, useEffect, useRef, useMemo } from 'react';
+      import { createRoot } from 'react-dom/client';
+      import * as THREE from 'three';
+      import { create } from 'zustand';
+      import { Canvas, useFrame, useThree } from '@react-three/fiber';
+      import { EffectComposer, Bloom } from '@react-three/postprocessing';
+      import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+      import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 
-// ---- 手势检测 ----
-function isFingerUp(lm, tip, pip, isThumb = false) {
-  if (isThumb) {
-    const dx = lm[tip].x - lm[5].x;
-    const dy = lm[tip].y - lm[5].y;
-    const dTip = Math.sqrt(dx*dx + dy*dy);
-    const dx2 = lm[pip].x - lm[5].x;
-    const dy2 = lm[pip].y - lm[5].y;
-    const dPip = Math.sqrt(dx2*dx2 + dy2*dy2);
-    if (dPip === 0) return false;
-    return dTip > dPip * 1.1;
-  }
-  return lm[tip].y < lm[pip].y;
-}
+      // ==========================================
+      // src/store.ts
+      // ==========================================
 
-function detectGesture(lm) {
-  const up = [
-    isFingerUp(lm, 4, 3, true),
-    isFingerUp(lm, 8, 6),
-    isFingerUp(lm, 12, 10),
-    isFingerUp(lm, 16, 14),
-    isFingerUp(lm, 20, 18),
-  ];
-  const count = up.filter(Boolean).length;
-  if (count === 0) return 'FIST';
-  if (count === 5) return 'OPEN';
-  if (count === 1 && up[1]) return 'POINT';
-  if (count === 2 && up[1] && up[2]) return 'PEACE';
-  if (count === 3 && up[1] && up[2] && up[3]) return 'THREE';
-  if (count === 4 && !up[0]) return 'FOUR';
-  return 'OPEN';
-}
+      // 简单的移动端检测
+      const isMobile =
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+          navigator.userAgent
+        ) || window.innerWidth < 768;
 
-function gestureLabel(g) {
-  const map = { 'FIST':'✊ 握拳','OPEN':'✋ 张开','POINT':'☝️ 食指','PEACE':'✌️ 剪刀','THREE':'🤟 爱','FOUR':'🖖 四指' };
-  return map[g] || g;
-}
+      const CONFIG = {
+        swordCount: isMobile ? 300 : 500,
+        pathHistoryLength: 300,
+        maxSpeed: 25,
+        sprintSpeed: 50,
+        steerForce: 28,
+        separationDist: 3,
+        separationForce: 10,
+        noiseScale: 0.3, // 噪声缩放
+        noiseStrength: 1, // 噪声强度
+        formationRadius: 1.5, // 剑阵半径
+        dragonDensity: 0.8, // 龙卷模式密度
+        // 护盾模式参数
+        shieldRadius: 18, // 护盾球体半径
+        shieldOrbitSpeed: 2.5, // 轨道旋转速度
+        // 莲花模式参数
+        lotusRadius: 24, // 莲花半径
+        lotusRotateSpeed: 2.5, // 莲花旋转速度
+        // 大庚剑阵参数
+        dagengRadius: 30, // 剑阵半径
+        dagengHeight: 20, // 剑阵高度范围
+        dagengRotateSpeed: 0.2, // 整体旋转速度
+      };
 
-function gestureColor(g) {
-  const map = { 'FIST':[255,50,80],'OPEN':[50,200,255],'POINT':[255,210,50],'PEACE':[80,255,150],'THREE':[200,100,255],'FOUR':[255,180,60] };
-  return map[g] || [80,180,255];
-}
+      // 手势模式
+      // type GestureMode = 'DRAGON' | 'SHIELD' | 'LOTUS' | 'DAGENG';
 
-// ---- 渲染骨架（使用镜像坐标） ----
-function drawSkeleton(lm) {
-  // 连接线 - 发光
-  for (const [i, j] of HAND_CONNECTIONS) {
-    const x1 = lx(lm, i), y1 = ly(lm, i);
-    const x2 = lx(lm, j), y2 = ly(lm, j);
-    ctx.save();
-    ctx.shadowColor = 'rgba(100,200,255,0.4)';
-    ctx.shadowBlur = 6;
-    ctx.strokeStyle = 'rgba(150,220,255,0.3)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-    ctx.restore();
-  }
+      const useHandStore = create((set, get) => ({
+        targetPosition: new THREE.Vector3(0, 0, 0),
+        isTracking: false,
+        gestureMode: 'LOTUS',
+        pathHistory: Array.from(
+          { length: CONFIG.pathHistoryLength },
+          () => new THREE.Vector3(0, 0, 0)
+        ),
+        lastDirection: new THREE.Vector3(0, 0, 0),
 
-  // 关节点
-  for (let i = 0; i < lm.length; i++) {
-    const x = lx(lm, i), y = ly(lm, i);
-    const isTip = FINGERTIPS.includes(i);
-    const idx = FINGERTIPS.indexOf(i);
-    const [r, g, b] = idx >= 0 ? FINGER_COLORS[idx] : [80, 180, 255];
-    const size = isTip ? 5 : 2.5;
+        setTarget: (pos) => set({ targetPosition: pos }),
 
-    if (isTip) {
-      // 指尖大光环
-      ctx.save();
-      ctx.shadowColor = `rgb(${r},${g},${b})`;
-      ctx.shadowBlur = 30;
-      ctx.beginPath();
-      ctx.arc(x, y, size + 2, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${r},${g},${b},0.3)`;
-      ctx.fill();
-      ctx.restore();
-    }
+        setTracking: (tracking) => set({ isTracking: tracking }),
 
-    ctx.save();
-    ctx.shadowColor = `rgb(${r},${g},${b})`;
-    ctx.shadowBlur = isTip ? 20 : 8;
-    ctx.beginPath();
-    ctx.arc(x, y, size, 0, Math.PI * 2);
-    ctx.fillStyle = isTip ? `rgb(${r},${g},${b})` : 'rgba(180,220,255,0.5)';
-    ctx.fill();
-    ctx.restore();
+        setGestureMode: (mode) => set({ gestureMode: mode }),
 
-    if (isTip) {
-      ctx.save();
-      ctx.shadowBlur = 0;
-      ctx.beginPath();
-      ctx.arc(x, y, size * 0.35, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-}
+        updatePath: (pos) => {
+          const { pathHistory, lastDirection } = get();
+          const last = pathHistory[0];
+          const diff = pos.clone().sub(last);
+          const dist = diff.length();
 
-// ---- 手势变化特效 ----
-function onGestureChange(newGesture, lm) {
-  if (newGesture === prevGesture) return;
-  prevGesture = newGesture;
+          if (dist > 0.1) {
+            lastDirection.copy(diff.normalize());
+            pathHistory.pop();
+            pathHistory.unshift(pos.clone());
+          }
+        },
 
-  const cx = (lx(lm, 5) + lx(lm, 9) + lx(lm, 13) + lx(lm, 17)) / 4;
-  const cy = (ly(lm, 5) + ly(lm, 9) + ly(lm, 13) + ly(lm, 17)) / 4;
-  const color = gestureColor(newGesture);
+        extendPath: () => {
+          const { pathHistory, lastDirection } = get();
+          if (lastDirection.length() < 0.01) return;
 
-  // 组合特效
-  switch (newGesture) {
-    case 'FIST':
-      particles.implode(cx, cy, [255, 60, 80], 35);
-      particles.ring(cx, cy, [255, 100, 120], 20);
-      break;
-    case 'OPEN':
-      particles.burst(cx, cy, [60, 200, 255], 50, 10, { glowMult: 1.5 });
-      particles.spiral(cx, cy, [100, 220, 255], 30);
-      break;
-    case 'POINT':
-      particles.burst(cx, cy, [255, 220, 50], 30, 6);
-      particles.ring(cx, cy, [255, 200, 80], 16);
-      break;
-    case 'PEACE':
-      particles.burst(cx, cy, [80, 255, 150], 40, 8, { glowMult: 1.3 });
-      particles.spiral(cx, cy, [120, 255, 180], 24);
-      break;
-    case 'THREE':
-      particles.burst(cx, cy, [200, 100, 255], 45, 9, { glowMult: 1.4 });
-      particles.ring(cx, cy, [220, 140, 255], 24);
-      break;
-    case 'FOUR':
-      particles.burst(cx, cy, [255, 180, 60], 40, 8);
-      particles.spiral(cx, cy, [255, 200, 100], 24);
-      break;
-  }
-}
+          const last = pathHistory[0];
+          const newPoint = last
+            .clone()
+            .add(lastDirection.clone().multiplyScalar(0.3));
+          pathHistory.pop();
+          pathHistory.unshift(newPoint);
+        },
+      }));
 
-// ---- 绘制手势UI ----
-function drawGestureUI() {
-  ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,0.8)';
-  ctx.shadowBlur = 20;
+      // ==========================================
+      // src/services/HandTrackingService.ts
+      // ==========================================
 
-  const label = gestureLabel(gesture);
-  ctx.font = '600 44px -apple-system, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  ctx.fillStyle = '#fff';
-  ctx.globalAlpha = 0.85;
-  ctx.fillText(label, W / 2, 42);
+      // 全局状态引用
+      let globalVideo = null;
+      let globalLandmarker = null;
+      let initPromise = null;
 
-  ctx.globalAlpha = 0.2;
-  ctx.font = '13px -apple-system, sans-serif';
-  ctx.fillText('手势追踪 · 粒子幻境', W / 2, 96);
+      // 初始化函数（单例模式）
+      function initHandTracking(videoElement) {
+        if (initPromise) return initPromise;
 
-  ctx.restore();
-}
+        initPromise = (async () => {
+          globalVideo = videoElement;
 
-// ---- 主循环 ----
-let lastTime = 0;
-let frameCount = 0;
-let fps = 0;
-let fpsTimer = 0;
-
-function animate(time) {
-  const dt = lastTime ? Math.min((time - lastTime) / 16.667, 3) : 1;
-  lastTime = time;
-  timeAcc += dt;
-
-  // FPS
-  frameCount++;
-  fpsTimer += dt;
-  if (fpsTimer >= 60) {
-    fps = Math.round(frameCount / (fpsTimer / 60));
-    frameCount = 0; fpsTimer = 0;
-    fpsDisplay.textContent = `${fps} fps`;
-  }
-
-  // ---- 背景（无摄像头画面） ----
-  drawBackground(gesture ? gestureColor(gesture) : null);
-
-  // ---- MediaPipe 检测 ----
-  if (handLandmarker && video.readyState >= 2) {
-    const now = performance.now();
-    if (video.currentTime !== lastVideoTime) {
-      lastVideoTime = video.currentTime;
-      try {
-        const result = handLandmarker.detectForVideo(video, now);
-        const hands = result.landmarks;
-        activeHandCount = hands ? hands.length : 0;
-
-        if (hands) {
-          for (let h = 0; h < hands.length; h++) {
-            const lm = hands[h];
-
-            // 拖尾
-            updateFingertipTrails(lm);
-
-            const newGesture = detectGesture(lm);
-            if (newGesture !== gesture) {
-              gesture = newGesture;
-              onGestureChange(gesture, lm);
+          try {
+            // 检测屏幕方向模式 (优先使用 API)
+            let isPortrait = false;
+            if (typeof screen !== 'undefined' && screen.orientation) {
+              isPortrait = screen.orientation.type.includes('portrait');
+            } else if (typeof window.orientation !== 'undefined') {
+              isPortrait = Math.abs(window.orientation) !== 90;
+            } else if (typeof window !== 'undefined') {
+              isPortrait = window.innerHeight > window.innerWidth;
             }
 
-            // 指尖粒子发射
-            for (let f = 0; f < FINGERTIPS.length; f++) {
-              const x = lx(lm, FINGERTIPS[f]);
-              const y = ly(lm, FINGERTIPS[f]);
-              const color = FINGER_COLORS[f];
+            const widthIdeal = isPortrait ? 480 : 640;
+            const heightIdeal = isPortrait ? 640 : 480;
 
-              let emitCount = 0, spread = 1.0, opts = {};
-              if (gesture === 'FIST') emitCount = 0;
-              else if (gesture === 'POINT') {
-                if (f === 1) { emitCount = 6; spread = 0.1; opts.trailLen = 5; }
-                else emitCount = 0;
-              } else if (gesture === 'PEACE') {
-                if (f === 1 || f === 2) { emitCount = 5; spread = 0.2; opts.trailLen = 4; }
-                else emitCount = 0;
-              } else if (gesture === 'THREE') {
-                if (f >= 1 && f <= 3) { emitCount = 4; spread = 0.3; opts.trailLen = 3; }
-                else emitCount = 0;
-              } else if (gesture === 'FOUR') {
-                if (f >= 1) { emitCount = 3; spread = 0.4; }
-                else emitCount = 0;
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: {
+                width: { ideal: widthIdeal },
+                height: { ideal: heightIdeal },
+                facingMode: 'user',
+              },
+            });
+
+            videoElement.srcObject = stream;
+
+            await new Promise((resolve) => {
+              if (videoElement.readyState >= 2) {
+                resolve();
               } else {
-                emitCount = 3;
-                spread = 1.4;
-                opts.trailLen = 3;
+                videoElement.onloadeddata = () => resolve();
               }
+            });
 
-              if (emitCount > 0) particles.emit(x, y, color, emitCount, spread, opts);
+            await videoElement.play().catch((e) => {
+              console.warn('Auto-play failed, waiting for user interaction', e);
+            });
+
+            // 尝试加载 AI 模型
+            // 注意：在 file:// 协议下，MediaPipe 的 WASM 加载往往会失败
+            // 如果失败，我们应该捕获错误并返回 false，允许应用以降级模式运行
+            try {
+              const vision = await FilesetResolver.forVisionTasks(
+                'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+              );
+
+              globalLandmarker = await HandLandmarker.createFromOptions(
+                vision,
+                {
+                  baseOptions: {
+                    modelAssetPath:
+                      'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+                    delegate: 'GPU',
+                  },
+                  runningMode: 'VIDEO',
+                  numHands: 1,
+                  minHandDetectionConfidence: 0.5,
+                  minTrackingConfidence: 0.5,
+                }
+              );
+              console.log('Hand tracking initialized successfully');
+              return true;
+            } catch (wasmError) {
+              console.error('MediaPipe Init Failed:', wasmError);
+              // 抛出错误以便外层处理 UI 提示
+              throw new Error(
+                `AI模型加载失败: ${wasmError.message}. 请尝试刷新或检查网络连接。`
+              );
             }
+          } catch (e) {
+            console.error('Hand tracking init error:', e);
+            // 将错误信息暴露给全局，以便 UI 显示
+            window._handTrackingError = e.message;
+            initPromise = null;
+            return false;
+          }
+        })();
 
-            // 画骨架
-            drawSkeleton(lm);
+        return initPromise;
+      }
+
+      // 检测手势类型
+      function detectGesture(landmarks) {
+        // 计算三点之间的角度
+        const getAngle = (p1, p2, p3) => {
+          const v1 = {
+            x: p1.x - p2.x,
+            y: p1.y - p2.y,
+            z: p1.z - p2.z,
+          };
+          const v2 = {
+            x: p3.x - p2.x,
+            y: p3.y - p2.y,
+            z: p3.z - p2.z,
+          };
+          const dot = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
+          const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y + v1.z * v1.z);
+          const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y + v2.z * v2.z);
+          const rad = Math.acos(dot / (mag1 * mag2));
+          return (rad * 180) / Math.PI;
+        };
+
+        const isFingerExtended = (fingerIdx) => {
+          let p1, p2, p3;
+          if (fingerIdx === 0) {
+            p1 = landmarks[1];
+            p2 = landmarks[2];
+            p3 = landmarks[3];
+          } else {
+            const offset = fingerIdx * 4;
+            p1 = landmarks[offset + 1];
+            p2 = landmarks[offset + 2];
+            p3 = landmarks[offset + 3];
+          }
+          const angle = getAngle(p1, p2, p3);
+          return angle > 150;
+        };
+
+        const fingerExtended = [0, 1, 2, 3, 4].map(isFingerExtended);
+        const [thumb, index, middle, ring, pinky] = fingerExtended;
+
+        const isGunGesture = thumb && index && !middle && !ring && !pinky;
+        const isSwordGesture = index && middle && !pinky;
+        const isFist = fingerExtended.filter((x) => x).length <= 1;
+        const isOpenPalm = index && middle && ring && pinky;
+        const isRockGesture = index && pinky && !middle && !ring;
+
+        if (isFist) return 'SHIELD';
+        if (isRockGesture) return 'DAGENG';
+        if (isGunGesture) return 'DRAGON';
+        if (isSwordGesture) return 'DRAGON';
+        if (isOpenPalm) return 'LOTUS';
+
+        return 'LOTUS';
+      }
+
+      // ==========================================
+      // src/components/SwordSwarm.tsx
+      // ==========================================
+
+      // 简化版 Simplex Noise
+      const simplex = {
+        noise3D: (x, y, z) => {
+          return (
+            Math.sin(x * 1.2 + y * 0.8) *
+            Math.cos(y * 1.1 + z * 0.9) *
+            Math.sin(z * 0.7 + x * 1.3)
+          );
+        },
+      };
+
+      function SwordSwarm() {
+        const meshRef = useRef(null);
+        const auraRef = useRef(null);
+        const dummy = useMemo(() => new THREE.Object3D(), []);
+
+        // 物理状态
+        const positions = useRef([]);
+        const velocities = useRef([]);
+
+        // 初始化
+        if (positions.current.length === 0) {
+          for (let i = 0; i < CONFIG.swordCount; i++) {
+            positions.current.push(
+              new THREE.Vector3(
+                (Math.random() - 0.5) * 20,
+                (Math.random() - 0.5) * 15,
+                (Math.random() - 0.5) * 10 - 5
+              )
+            );
+            velocities.current.push(new THREE.Vector3());
+          }
+          window.swordPositions = positions.current;
+        }
+
+        // 剑形几何体
+        const geometry = useMemo(() => {
+          const bladeGeo = new THREE.ConeGeometry(0.12, 2.5, 4);
+          bladeGeo.scale(0.4, 1, 1);
+          bladeGeo.rotateX(Math.PI / 2);
+          bladeGeo.translate(0, 0, 1.0);
+
+          const guardGeo = new THREE.BoxGeometry(0.5, 0.08, 0.15);
+          guardGeo.translate(0, 0, -0.2);
+
+          const handleGeo = new THREE.CylinderGeometry(0.05, 0.06, 0.7, 6);
+          handleGeo.rotateX(Math.PI / 2);
+          handleGeo.translate(0, 0, -0.6);
+
+          const merged = mergeGeometries([bladeGeo, guardGeo, handleGeo]);
+          return merged || bladeGeo;
+        }, []);
+
+        const material = useMemo(
+          () =>
+            new THREE.MeshBasicMaterial({
+              color: 0x00ff88,
+              transparent: true,
+              opacity: 0.9,
+            }),
+          []
+        );
+
+        const auraGeometry = useMemo(() => {
+          const auraGeo = new THREE.ConeGeometry(0.15, 2.6, 4);
+          auraGeo.scale(0.5, 1, 1);
+          auraGeo.rotateX(Math.PI / 2);
+          auraGeo.translate(0, 0, 1.0);
+          return auraGeo;
+        }, []);
+
+        const auraMaterial = useMemo(
+          () =>
+            new THREE.MeshBasicMaterial({
+              color: 0xffdd44,
+              transparent: true,
+              opacity: 0.6,
+              blending: THREE.AdditiveBlending,
+            }),
+          []
+        );
+
+        useFrame(({ clock }) => {
+          if (!meshRef.current) return;
+
+          const targetPosition = useHandStore.getState().targetPosition;
+          const isTracking = useHandStore.getState().isTracking;
+          const gestureMode = useHandStore.getState().gestureMode;
+          const pathHistory = useHandStore.getState().pathHistory;
+          const extendPath = useHandStore.getState().extendPath;
+
+          const time = clock.getElapsedTime();
+          const delta = 1 / 60;
+
+          // 无手势时自动盘旋：使用默认的 LOTUS 模式
+          let currentTarget = targetPosition;
+          if (!isTracking) {
+            currentTarget = new THREE.Vector3(0, 0, 0);
+            // 仍然更新历史路径，防止切换时跳变
+            pathHistory.pop();
+            pathHistory.unshift(currentTarget.clone());
+          } else if (gestureMode === 'DRAGON') {
+            extendPath();
           }
 
-          // 画指尖拖尾
-          drawFingertipTrails(ctx);
+          // 根据模式计算目标
+          for (let i = 0; i < CONFIG.swordCount; i++) {
+            const pos = positions.current[i];
+            const vel = velocities.current[i];
+            const target = new THREE.Vector3();
+
+            if (gestureMode === 'SHIELD' && isTracking) {
+              // ============ 护盾模式：球形轨道 ============
+              // 使用斐波那契球面均匀分布
+              const phi = Math.acos(1 - (2 * (i + 0.5)) / CONFIG.swordCount);
+              const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+
+              // 基础轨道位置
+              const orbitX =
+                CONFIG.shieldRadius *
+                Math.sin(phi) *
+                Math.cos(theta + time * CONFIG.shieldOrbitSpeed);
+              const orbitY =
+                CONFIG.shieldRadius *
+                Math.sin(phi) *
+                Math.sin(theta + time * CONFIG.shieldOrbitSpeed);
+              const orbitZ = CONFIG.shieldRadius * Math.cos(phi);
+
+              // 添加轨道旋转动画
+              const rotatedX =
+                orbitX * Math.cos(time * 0.3) - orbitZ * Math.sin(time * 0.3);
+              const rotatedZ =
+                orbitX * Math.sin(time * 0.3) + orbitZ * Math.cos(time * 0.3);
+
+              target.set(
+                currentTarget.x + rotatedX,
+                currentTarget.y + orbitY,
+                currentTarget.z + rotatedZ
+              );
+
+              // 添加微小波动
+              target.x += Math.sin(time * 3 + i) * 0.2;
+              target.y += Math.cos(time * 3 + i * 0.7) * 0.2;
+            } else if (
+              gestureMode === 'LOTUS' ||
+              (gestureMode === 'LOTUS' && !isTracking)
+            ) {
+              // ============ 莲花模式：斐波那契螺旋（黄金角）优化 ============
+              // 这种分布方式更像自然界的莲花/向日葵，视觉效果更紧密壮观
+
+              // 1. 基础参数
+              const goldenAngle = Math.PI * (3 - Math.sqrt(5)); // ~137.5度
+              const maxRadius = CONFIG.lotusRadius;
+              const minRadius = 6; // 中心镂空半径
+
+              // 2. 计算每个剑的位置
+              // r = c * sqrt(i)，使得面积分布均匀
+              // 映射到 [minRadius, maxRadius] 区间
+              const t = i / (CONFIG.swordCount - 1); // 0 -> 1
+              const rRatio = Math.sqrt(t);
+              const r = minRadius + (maxRadius - minRadius) * rRatio;
+
+              // 3. 角度 + 旋转动画
+              // 基础角度 + 整体旋转 + 半径相关的差速旋转（形成漩涡感）
+              const theta = i * goldenAngle + time * CONFIG.lotusRotateSpeed;
+
+              // 4. 呼吸效果：整体缩放
+              const breathe = 1 + Math.sin(time * 2) * 0.05;
+              const currentR = r * breathe;
+
+              // 5. 坐标计算
+              const x = currentR * Math.cos(theta);
+              const y = currentR * Math.sin(theta);
+
+              // 6. Z轴造型：扁平切面（完全平面，仅保留微小波动）
+              const z = Math.sin(time * 2 + i * 0.1) * 0.2; // 极小的上下浮动
+
+              target.set(
+                currentTarget.x + x,
+                currentTarget.y + y,
+                currentTarget.z + z
+              );
+            } else if (gestureMode === 'DAGENG' && isTracking) {
+              // ============ 大庚剑阵 ============
+
+              // 特殊处理：第0号剑作为【镇派主剑】
+              if (i === 0) {
+                const centralHeight = currentTarget.y + 5; // 主剑稍微高一点
+                target.set(currentTarget.x, centralHeight, currentTarget.z);
+                // 主剑的 scale 在下面统一设置
+              } else {
+                // 其他剑：环绕主剑
+                // 修正 i 索引，让分布计算不包含 0
+                const effectiveI = i - 1;
+                const effectiveCount = CONFIG.swordCount - 1;
+
+                // 垂直圆柱/环形阵列，剑尖朝下
+                const layerCount = 10;
+                const perLayer = Math.max(
+                  1,
+                  Math.floor(effectiveCount / layerCount)
+                );
+                const layerIdx = Math.floor(effectiveI / perLayer);
+                const idxInLayer = effectiveI % perLayer;
+
+                // 半径：多层同心圆 (基础半径 + 层间距)
+                // 增加基础半径，给主剑留出空间
+                const radius = CONFIG.dagengRadius + layerIdx * 1.5 + 2;
+
+                // 角度：偶数层顺时针，奇数层逆时针
+                const dir = layerIdx % 2 === 0 ? 1 : -1;
+                const theta =
+                  (idxInLayer / perLayer) * Math.PI * 2 +
+                  time * CONFIG.dagengRotateSpeed * dir;
+
+                // 高度：呈圆柱分布
+                const hCenter = currentTarget.y - 10;
+                const hRange = CONFIG.dagengHeight;
+                const hRand = Math.sin(effectiveI * 13.1) * 0.5 + 0.5;
+                const height = hCenter + (hRand - 0.5) * hRange;
+
+                target.set(
+                  currentTarget.x + Math.cos(theta) * radius,
+                  height,
+                  currentTarget.z + Math.sin(theta) * radius
+                );
+              }
+            } else {
+              // ============ 游龙模式 ============
+              if (i < 5) {
+                target.copy(currentTarget);
+                target.x += Math.sin(time * 8 + i) * 0.3;
+                target.y += Math.cos(time * 8 + i) * 0.3;
+              } else {
+                // 龙身：沿轨迹历史插值
+                const pathIdx = i * 0.8; // 控制龙身长度 (0.5 -> 0.6 略微调大)
+                const idxA = Math.min(
+                  Math.floor(pathIdx),
+                  pathHistory.length - 1
+                );
+                const idxB = Math.min(idxA + 1, pathHistory.length - 1);
+                const alpha = pathIdx - Math.floor(pathIdx);
+
+                if (pathHistory[idxA] && pathHistory[idxB]) {
+                  target.lerpVectors(
+                    pathHistory[idxA],
+                    pathHistory[idxB],
+                    alpha
+                  );
+                } else if (pathHistory[idxA]) {
+                  target.copy(pathHistory[idxA]);
+                } else {
+                  target.copy(currentTarget);
+                }
+
+                // 增加一些随机抖动，使龙身更自然
+                target.x += Math.sin(time * 10 + i * 0.5) * 0.2;
+                target.y += Math.cos(time * 10 + i * 0.5) * 0.2;
+
+                const ns = CONFIG.noiseScale;
+                const na =
+                  CONFIG.noiseStrength *
+                  (0.8 + Math.sin(time * 2 + i * 0.05) * 0.4);
+                target.x += simplex.noise3D(pos.x * ns, pos.y * ns, time) * na;
+                target.y +=
+                  simplex.noise3D(pos.y * ns, pos.z * ns, time + 100) * na;
+                target.z +=
+                  simplex.noise3D(pos.z * ns, pos.x * ns, time + 200) * na;
+              }
+            }
+
+            // 动态速度
+            let speed =
+              gestureMode === 'SHIELD' ? CONFIG.sprintSpeed : CONFIG.maxSpeed;
+            if (target.distanceTo(pos) > 4) speed = CONFIG.sprintSpeed;
+            else if (target.distanceTo(pos) < 1)
+              speed = target.distanceTo(pos) * CONFIG.maxSpeed;
+
+            // 计算转向力
+            const desired = target.sub(pos);
+            const d = desired.length();
+
+            if (d > 0) {
+              desired.normalize();
+              // 靠近目标时减速（到达行为）
+              if (d < 10) {
+                desired.multiplyScalar(speed * (d / 10));
+              } else {
+                desired.multiplyScalar(speed);
+              }
+            }
+
+            const steer = desired.sub(vel);
+            // 护盾和莲花模式下需要更强的控制力
+            const steerFactor =
+              gestureMode === 'SHIELD' || gestureMode === 'LOTUS' ? 3 : 1;
+            steer.clampLength(0, CONFIG.steerForce * delta * steerFactor);
+
+            vel.add(steer);
+
+            // 分离力（护盾和莲花模式下禁用，除非是待机状态的莲花）
+            if (
+              i > 0 &&
+              gestureMode !== 'SHIELD' &&
+              (gestureMode !== 'LOTUS' || !isTracking)
+            ) {
+              const prev = positions.current[i - 1];
+              const diff = pos.clone().sub(prev);
+              const d = diff.length();
+              if (d < CONFIG.separationDist && d > 0.01) {
+                diff.normalize().multiplyScalar(CONFIG.separationForce * delta);
+                vel.add(diff);
+              }
+            }
+
+            // 更新位置
+            pos.add(vel.clone().multiplyScalar(delta));
+
+            // 更新矩阵
+            dummy.position.copy(pos);
+
+            // 朝向
+            let lookTarget;
+            if (gestureMode === 'SHIELD' && isTracking) {
+              if (vel.length() > 0.1) {
+                lookTarget = pos.clone().add(vel.clone().normalize());
+              } else {
+                const relPos = pos.clone().sub(currentTarget);
+                const tangent = new THREE.Vector3(
+                  -relPos.z,
+                  0,
+                  relPos.x
+                ).normalize();
+                lookTarget = pos.clone().add(tangent);
+              }
+            } else if (gestureMode === 'LOTUS') {
+              const outward = pos.clone().sub(currentTarget).normalize();
+              lookTarget = pos.clone().add(outward);
+            } else if (gestureMode === 'DAGENG' && isTracking) {
+              lookTarget = pos.clone().add(new THREE.Vector3(0, -1, 0));
+            } else {
+              lookTarget = pos
+                .clone()
+                .add(vel.length() > 0.1 ? vel : new THREE.Vector3(0, 0, -1));
+            }
+            dummy.lookAt(lookTarget);
+
+            // 缩放
+            let targetScale = 1;
+            if (gestureMode === 'DAGENG' && isTracking) {
+              if (i === 0) targetScale = 6;
+              else targetScale = 1.5;
+            }
+
+            const currentScale = meshRef.current.userData.currentScale || 1;
+            const lerpSpeed = i === 0 && gestureMode === 'DAGENG' ? 0.01 : 0.02;
+            const newScale = THREE.MathUtils.lerp(
+              currentScale,
+              targetScale,
+              lerpSpeed
+            );
+            meshRef.current.userData.currentScale = newScale;
+
+            dummy.scale.set(newScale, newScale, newScale);
+            dummy.updateMatrix();
+            meshRef.current.setMatrixAt(i, dummy.matrix);
+
+            // Aura
+            if (auraRef.current) {
+              const isActive =
+                gestureMode === 'SHIELD'
+                  ? Math.sin(time * 30 + i * 0.5) > 0.0
+                  : Math.sin(time * 20 + i * 0.7) > 0.3;
+
+              const auraScale = newScale * (isActive ? 1.3 : 1.0);
+
+              if (!isActive && !(i === 0 && gestureMode === 'DAGENG')) {
+                dummy.scale.set(0, 0, 0);
+              } else {
+                dummy.scale.set(auraScale, auraScale, auraScale);
+              }
+
+              dummy.updateMatrix();
+              auraRef.current.setMatrixAt(i, dummy.matrix);
+              dummy.scale.set(newScale, newScale, newScale);
+            }
+          }
+
+          meshRef.current.instanceMatrix.needsUpdate = true;
+          if (auraRef.current) {
+            auraRef.current.instanceMatrix.needsUpdate = true;
+          }
+        });
+
+        return (
+          <group>
+            <instancedMesh
+              ref={meshRef}
+              args={[geometry, material, CONFIG.swordCount]}
+              frustumCulled={false}
+            />
+            <instancedMesh
+              ref={auraRef}
+              args={[auraGeometry, auraMaterial, CONFIG.swordCount]}
+              frustumCulled={false}
+            />
+          </group>
+        );
+      }
+
+      // ==========================================
+      // src/components/DivineLightning.tsx
+      // ==========================================
+      function DivineLightning() {
+        const lineRef = useRef(null);
+
+        const geometry = useMemo(() => {
+          const geo = new THREE.BufferGeometry();
+          const posArray = new Float32Array(100 * 3 * 2); // 100 条线段
+          geo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+          return geo;
+        }, []);
+
+        const material = useMemo(
+          () =>
+            new THREE.LineBasicMaterial({
+              color: 0xffdd44,
+              transparent: true,
+              opacity: 0.8,
+              blending: THREE.AdditiveBlending,
+            }),
+          []
+        );
+
+        const intensityRef = useRef(0);
+
+        useFrame(({ clock }) => {
+          if (!lineRef.current) return;
+
+          const isTracking = useHandStore.getState().isTracking;
+          const gestureMode = useHandStore.getState().gestureMode;
+          const time = clock.getElapsedTime();
+
+          const targetIntensity = gestureMode === 'DAGENG' ? 1 : 0;
+          intensityRef.current = THREE.MathUtils.lerp(
+            intensityRef.current,
+            targetIntensity,
+            0.02
+          );
+          const intensity = intensityRef.current;
+
+          const flashSpeed = 15 + intensity * 10;
+          const flashThreshold = 0.7 - intensity * 0.3;
+          const count = Math.floor(30 + intensity * 70);
+          const maxDist = 5 + intensity * 20;
+          const jitter = 0.2 + intensity * 0.3;
+
+          const flash = Math.sin(time * flashSpeed) > flashThreshold;
+          lineRef.current.visible = flash && isTracking;
+          if (!flash || !isTracking) return;
+
+          const positions = window.swordPositions;
+          if (!positions || positions.length === 0) return;
+
+          const posAttr = lineRef.current.geometry.attributes.position;
+          const arr = posAttr.array;
+          let idx = 0;
+
+          for (let i = 0; i < count; i++) {
+            const a = Math.floor(Math.random() * CONFIG.swordCount);
+            const b = Math.floor(Math.random() * CONFIG.swordCount);
+
+            if (a >= positions.length || b >= positions.length) continue;
+
+            const pA = positions[a];
+            const pB = positions[b];
+
+            if (pA.distanceTo(pB) < maxDist) {
+              arr[idx++] = pA.x + (Math.random() - 0.5) * jitter;
+              arr[idx++] = pA.y + (Math.random() - 0.5) * jitter;
+              arr[idx++] = pA.z + (Math.random() - 0.5) * jitter;
+              arr[idx++] = pB.x + (Math.random() - 0.5) * jitter;
+              arr[idx++] = pB.y + (Math.random() - 0.5) * jitter;
+              arr[idx++] = pB.z + (Math.random() - 0.5) * jitter;
+            }
+          }
+          while (idx < arr.length) arr[idx++] = 0;
+          posAttr.needsUpdate = true;
+        });
+
+        return (
+          <lineSegments ref={lineRef} geometry={geometry} material={material} />
+        );
+      }
+
+      // ==========================================
+      // src/components/MagicCircle.tsx
+      // ==========================================
+      const vertexShader = `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+      `;
+
+      const fragmentShader = `
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform float uOpacity;
+
+      void main() {
+        vec2 center = vec2(0.5, 0.5);
+        float dist = distance(vUv, center);
+        
+        // 环形纹理生成
+        float ring1 = smoothstep(0.48, 0.485, dist) - smoothstep(0.49, 0.495, dist);
+        float ring2 = smoothstep(0.42, 0.425, dist) - smoothstep(0.43, 0.435, dist);
+        
+        // 旋转的符文点缀 (模拟)
+        float angle = atan(vUv.y - 0.5, vUv.x - 0.5);
+        float runes = sin(angle * 10.0 + uTime) * 0.5 + 0.5;
+        float runeRing = smoothstep(0.35, 0.45, dist) * runes * (smoothstep(0.45, 0.35, dist));
+
+        vec3 color = vec3(1.0, 0.9, 0.4); // 金色
+        float alpha = (ring1 + ring2 + runeRing * 0.3) * uOpacity;
+        
+        gl_FragColor = vec4(color, alpha);
+      }
+      `;
+
+      function MagicCircle() {
+        const meshRef = useRef(null);
+        const materialRef = useRef(null);
+        const gestureMode = useHandStore((state) => state.gestureMode);
+        const isTracking = useHandStore((state) => state.isTracking);
+
+        const opacityRef = useRef(0);
+
+        useFrame(({ clock }) => {
+          if (!meshRef.current || !materialRef.current) return;
+
+          const time = clock.getElapsedTime();
+          const targetOpacity = gestureMode === 'DAGENG' && isTracking ? 1 : 0;
+
+          opacityRef.current = THREE.MathUtils.lerp(
+            opacityRef.current,
+            targetOpacity,
+            0.05
+          );
+
+          materialRef.current.uniforms.uTime.value = time;
+          materialRef.current.uniforms.uOpacity.value = opacityRef.current;
+
+          meshRef.current.rotation.z = time * 0.1;
+          meshRef.current.visible = opacityRef.current > 0.01;
+
+          if (meshRef.current.visible) {
+            const targetPos = useHandStore.getState().targetPosition;
+            meshRef.current.position.set(
+              targetPos.x,
+              targetPos.y + 15,
+              targetPos.z
+            );
+          }
+        });
+
+        const uniforms = useMemo(
+          () => ({
+            uTime: { value: 0 },
+            uOpacity: { value: 0 },
+          }),
+          []
+        );
+
+        return (
+          <mesh
+            ref={meshRef}
+            rotation={[-Math.PI / 2, 0, 0]}
+            scale={[40, 40, 1]}
+          >
+            <planeGeometry args={[1, 1]} />
+            <shaderMaterial
+              ref={materialRef}
+              vertexShader={vertexShader}
+              fragmentShader={fragmentShader}
+              transparent={true}
+              side={THREE.DoubleSide}
+              depthWrite={false}
+              blending={THREE.AdditiveBlending}
+              uniforms={uniforms}
+            />
+          </mesh>
+        );
+      }
+
+      // ==========================================
+      // src/components/ShieldOrb.tsx
+      // ==========================================
+      function ShieldOrb() {
+        const meshRef = useRef(null);
+        const glowRef = useRef(null);
+
+        useFrame(({ clock }) => {
+          const targetPosition = useHandStore.getState().targetPosition;
+          const isTracking = useHandStore.getState().isTracking;
+          const gestureMode = useHandStore.getState().gestureMode;
+          const time = clock.getElapsedTime();
+
+          const shouldShow = isTracking && gestureMode === 'SHIELD';
+
+          if (meshRef.current && glowRef.current) {
+            const targetOpacity = shouldShow ? 0.3 : 0;
+            const currentOpacity = meshRef.current.material.opacity;
+            const newOpacity = THREE.MathUtils.lerp(
+              currentOpacity,
+              targetOpacity,
+              0.1
+            );
+
+            meshRef.current.material.opacity = newOpacity;
+            glowRef.current.material.opacity = newOpacity * 0.5;
+
+            meshRef.current.visible = newOpacity > 0.01;
+            glowRef.current.visible = newOpacity > 0.01;
+
+            const currentPos = isTracking
+              ? targetPosition
+              : new THREE.Vector3(
+                  Math.sin(time * 0.5) * 6,
+                  Math.cos(time * 0.4) * 4,
+                  Math.sin(time * 0.3) * 3
+                );
+
+            meshRef.current.position.lerp(currentPos, 0.1);
+            glowRef.current.position.lerp(currentPos, 0.1);
+
+            const breathe = 1 + Math.sin(time * 2) * 0.03;
+            meshRef.current.scale.setScalar(breathe);
+            glowRef.current.scale.setScalar(breathe * 1.15);
+
+            meshRef.current.rotation.y = time * 0.2;
+            meshRef.current.rotation.x = time * 0.1;
+          }
+        });
+
+        const innerMaterial = useMemo(
+          () =>
+            new THREE.MeshBasicMaterial({
+              color: 0x88ccff,
+              transparent: true,
+              opacity: 0,
+              side: THREE.DoubleSide,
+              blending: THREE.AdditiveBlending,
+            }),
+          []
+        );
+
+        const glowMaterial = useMemo(
+          () =>
+            new THREE.MeshBasicMaterial({
+              color: 0x4488ff,
+              transparent: true,
+              opacity: 0,
+              side: THREE.BackSide,
+              blending: THREE.AdditiveBlending,
+            }),
+          []
+        );
+
+        return (
+          <group>
+            <mesh ref={meshRef}>
+              <icosahedronGeometry args={[CONFIG.shieldRadius * 0.98, 2]} />
+              <primitive object={innerMaterial} attach="material" />
+            </mesh>
+
+            <mesh ref={glowRef}>
+              <sphereGeometry args={[CONFIG.shieldRadius * 1.1, 32, 32]} />
+              <primitive object={glowMaterial} attach="material" />
+            </mesh>
+          </group>
+        );
+      }
+
+      // ==========================================
+      // src/components/CameraController.tsx
+      // ==========================================
+      function CameraController() {
+        const { camera } = useThree();
+        const SMOOTH_SPEED = 0.02;
+
+        const smoothTarget = useRef(new THREE.Vector3(0, 0, 0));
+        const smoothCamPos = useRef(new THREE.Vector3(0, 5, 35));
+        const smoothLookAt = useRef(new THREE.Vector3(0, 0, 0));
+        const smoothZoom = useRef(30);
+
+        useFrame(({ clock }) => {
+          const isTracking = useHandStore.getState().isTracking;
+          const time = clock.getElapsedTime();
+          const positions = window.swordPositions;
+
+          let formationSize = 10;
+          const formationCenter = new THREE.Vector3(0, 0, 0);
+
+          if (positions && positions.length > 0) {
+            let minX = Infinity,
+              maxX = -Infinity;
+            let minY = Infinity,
+              maxY = -Infinity;
+            let sumX = 0,
+              sumY = 0,
+              sumZ = 0;
+
+            for (const pos of positions) {
+              minX = Math.min(minX, pos.x);
+              maxX = Math.max(maxX, pos.x);
+              minY = Math.min(minY, pos.y);
+              maxY = Math.max(maxY, pos.y);
+              sumX += pos.x;
+              sumY += pos.y;
+              sumZ += pos.z;
+            }
+
+            formationCenter.set(
+              sumX / positions.length,
+              sumY / positions.length,
+              sumZ / positions.length
+            );
+
+            const spanX = maxX - minX;
+            const spanY = maxY - minY;
+            formationSize = Math.max(spanX, spanY);
+          }
+
+          const gestureMode = useHandStore.getState().gestureMode;
+
+          const targetZoom = THREE.MathUtils.clamp(
+            formationSize * 1.2 + 18,
+            22,
+            gestureMode === 'DAGENG' ? 55 : 75
+          );
+
+          smoothZoom.current = THREE.MathUtils.lerp(
+            smoothZoom.current,
+            targetZoom,
+            SMOOTH_SPEED
+          );
+
+          let followPoint;
+          if (isTracking) {
+            followPoint = formationCenter.clone();
+          } else {
+            followPoint = new THREE.Vector3(
+              Math.sin(time * 0.5) * 6,
+              Math.cos(time * 0.4) * 4,
+              0
+            );
+          }
+          smoothTarget.current.lerp(followPoint, SMOOTH_SPEED);
+
+          const desiredCamPos = new THREE.Vector3(
+            smoothTarget.current.x * 0.25,
+            smoothTarget.current.y * 0.15 + 3,
+            smoothZoom.current
+          );
+          smoothCamPos.current.lerp(desiredCamPos, SMOOTH_SPEED);
+          camera.position.copy(smoothCamPos.current);
+
+          const desiredLookAt = new THREE.Vector3(
+            smoothTarget.current.x * 0.4,
+            smoothTarget.current.y * 0.25,
+            4
+          );
+          smoothLookAt.current.lerp(desiredLookAt, SMOOTH_SPEED);
+          camera.lookAt(smoothLookAt.current);
+        });
+
+        return null;
+      }
+
+      // ==========================================
+      // src/components/Scene.tsx
+      // ==========================================
+
+      function StarField() {
+        const starsRef = useRef(null);
+
+        const [positions, colors] = useMemo(() => {
+          const count = 2000;
+          const pos = new Float32Array(count * 3);
+          const col = new Float32Array(count * 3);
+
+          for (let i = 0; i < count; i++) {
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(2 * Math.random() - 1);
+            const r = 80 + Math.random() * 40;
+
+            pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+            pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+            pos[i * 3 + 2] = r * Math.cos(phi);
+
+            const brightness = 0.5 + Math.random() * 0.5;
+            col[i * 3] = brightness;
+            col[i * 3 + 1] = brightness;
+            col[i * 3 + 2] = brightness + Math.random() * 0.2;
+          }
+
+          return [pos, col];
+        }, []);
+
+        useFrame(({ clock }) => {
+          if (starsRef.current) {
+            starsRef.current.rotation.y = clock.getElapsedTime() * 0.01;
+          }
+        });
+
+        return (
+          <points ref={starsRef}>
+            <bufferGeometry>
+              <bufferAttribute
+                attach="attributes-position"
+                args={[positions, 3]}
+              />
+              <bufferAttribute attach="attributes-color" args={[colors, 3]} />
+            </bufferGeometry>
+            <pointsMaterial
+              size={0.3}
+              vertexColors
+              transparent
+              opacity={0.8}
+              sizeAttenuation
+            />
+          </points>
+        );
+      }
+
+      function SpiritParticles() {
+        const particlesRef = useRef(null);
+
+        const positions = useMemo(() => {
+          const count = 200;
+          const pos = new Float32Array(count * 3);
+
+          for (let i = 0; i < count; i++) {
+            pos[i * 3] = (Math.random() - 0.5) * 60;
+            pos[i * 3 + 1] = (Math.random() - 0.5) * 40;
+            pos[i * 3 + 2] = (Math.random() - 0.5) * 40;
+          }
+
+          return pos;
+        }, []);
+
+        useFrame(({ clock }) => {
+          if (particlesRef.current) {
+            const posArr =
+              particlesRef.current.geometry.attributes.position.array;
+            const time = clock.getElapsedTime();
+
+            for (let i = 0; i < posArr.length / 3; i++) {
+              posArr[i * 3 + 1] += Math.sin(time + i) * 0.01;
+
+              if (posArr[i * 3 + 1] > 20) {
+                posArr[i * 3 + 1] = -20;
+              }
+            }
+            particlesRef.current.geometry.attributes.position.needsUpdate = true;
+          }
+        });
+
+        return (
+          <points ref={particlesRef}>
+            <bufferGeometry>
+              <bufferAttribute
+                attach="attributes-position"
+                args={[positions, 3]}
+              />
+            </bufferGeometry>
+            <pointsMaterial
+              size={0.15}
+              color="#88ffaa"
+              transparent
+              opacity={0.5}
+              blending={THREE.AdditiveBlending}
+            />
+          </points>
+        );
+      }
+
+      function Scene() {
+        return (
+          <React.Fragment>
+            <color attach="background" args={['#030810']} />
+            <fog attach="fog" args={['#030810', 30, 100]} />
+
+            <StarField />
+            <SpiritParticles />
+
+            <ambientLight intensity={0.1} color="#4488ff" />
+
+            <CameraController />
+            <SwordSwarm />
+            <DivineLightning />
+            <MagicCircle />
+
+            <EffectComposer>
+              <Bloom
+                luminanceThreshold={0.1}
+                luminanceSmoothing={0.4}
+                intensity={2.0}
+                radius={0.6}
+                mipmapBlur
+              />
+            </EffectComposer>
+          </React.Fragment>
+        );
+      }
+
+      // ==========================================
+      // src/components/HandController.tsx
+      // ==========================================
+      let lastVideoTime = -1;
+
+      function HandController() {
+        const { camera } = useThree();
+        const setTarget = useHandStore((state) => state.setTarget);
+        const setTracking = useHandStore((state) => state.setTracking);
+        const setGestureMode = useHandStore((state) => state.setGestureMode);
+        const updatePath = useHandStore((state) => state.updatePath);
+
+        const pendingGesture = useRef(null);
+        const gestureStartTime = useRef(0);
+        const currentConfirmedGesture = useRef('LOTUS');
+
+        useFrame(({ clock }) => {
+          if (!globalLandmarker || !globalVideo || globalVideo.readyState !== 4)
+            return;
+          if (globalVideo.currentTime === lastVideoTime) return;
+
+          lastVideoTime = globalVideo.currentTime;
+          const results = globalLandmarker.detectForVideo(
+            globalVideo,
+            performance.now()
+          );
+
+          if (results.landmarks && results.landmarks.length > 0) {
+            setTracking(true);
+            const lm = results.landmarks[0];
+
+            const detectedGesture = detectGesture(lm);
+            const now = clock.getElapsedTime();
+
+            if (detectedGesture !== pendingGesture.current) {
+              pendingGesture.current = detectedGesture;
+              gestureStartTime.current = now;
+            } else {
+              const duration = now - gestureStartTime.current;
+              const DELAY_THRESHOLD = 0.25;
+
+              if (
+                duration > DELAY_THRESHOLD &&
+                detectedGesture !== currentConfirmedGesture.current
+              ) {
+                currentConfirmedGesture.current = detectedGesture;
+                setGestureMode(detectedGesture);
+              }
+            }
+
+            const activeGesture = currentConfirmedGesture.current;
+            let targetPoint;
+
+            if (activeGesture === 'SHIELD' || activeGesture === 'LOTUS') {
+              const wrist = lm[0];
+              const middleBase = lm[9];
+              targetPoint = {
+                x: (wrist.x + middleBase.x) / 2,
+                y: (wrist.y + middleBase.y) / 2,
+              };
+            } else {
+              targetPoint = lm[8];
+            }
+
+            const ndcX = (1 - targetPoint.x) * 2 - 1;
+            const ndcY = -(targetPoint.y * 2 - 1);
+
+            const vec = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
+            const dir = vec.sub(camera.position).normalize();
+            const dist = -camera.position.z / dir.z;
+            const worldPos = camera.position
+              .clone()
+              .add(dir.multiplyScalar(dist));
+
+            setTarget(worldPos);
+
+            if (activeGesture === 'DRAGON') {
+              updatePath(worldPos);
+            }
+          } else {
+            setTracking(false);
+          }
+        });
+
+        return null;
+      }
+
+      // ==========================================
+      // src/components/OrientationGuard.tsx
+      // ==========================================
+      function OrientationGuard({ children }) {
+        const [isPortrait, setIsPortrait] = useState(false);
+        const [dismissed, setDismissed] = useState(false);
+
+        useEffect(() => {
+          const checkOrientation = () => {
+            let isVertical = false;
+
+            if (screen.orientation) {
+              isVertical = screen.orientation.type.includes('portrait');
+            } else if (typeof window.orientation !== 'undefined') {
+              isVertical = Math.abs(window.orientation) !== 90;
+            } else if (window.matchMedia) {
+              isVertical = window.matchMedia('(orientation: portrait)').matches;
+            } else {
+              isVertical = window.innerHeight > window.innerWidth;
+            }
+
+            const isMobile =
+              (navigator.userAgentData && navigator.userAgentData.mobile) ||
+              /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+                navigator.userAgent
+              ) ||
+              'ontouchstart' in window ||
+              window.innerWidth < 1024;
+
+            setIsPortrait(isMobile && isVertical);
+          };
+
+          checkOrientation();
+
+          if (screen.orientation) {
+            screen.orientation.addEventListener('change', checkOrientation);
+          }
+          window.addEventListener('orientationchange', checkOrientation);
+          window.addEventListener('resize', checkOrientation);
+
+          return () => {
+            if (screen.orientation) {
+              screen.orientation.removeEventListener(
+                'change',
+                checkOrientation
+              );
+            }
+            window.removeEventListener('orientationchange', checkOrientation);
+            window.removeEventListener('resize', checkOrientation);
+          };
+        }, []);
+
+        if (isPortrait && !dismissed) {
+          return (
+            <React.Fragment>
+              {children}
+              <div
+                style={{
+                  position: 'fixed',
+                  top: 0,
+                  left: 0,
+                  width: '100vw',
+                  height: '100vh',
+                  backgroundColor: 'rgba(0, 0, 0, 0.85)',
+                  backdropFilter: 'blur(5px)',
+                  color: '#00ff88',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  zIndex: 9999,
+                  textAlign: 'center',
+                  padding: '20px',
+                  transition: 'opacity 0.3s',
+                }}
+              >
+                <div style={{ fontSize: '48px', marginBottom: '20px' }}>
+                  📱➡️🔄
+                </div>
+                <h2
+                  style={{
+                    marginBottom: '10px',
+                    fontFamily: '"Courier New", monospace',
+                    fontSize: '24px',
+                  }}
+                >
+                  建议横屏体验更佳
+                </h2>
+                <p
+                  style={{
+                    color: '#ccc',
+                    maxWidth: '300px',
+                    marginBottom: '30px',
+                    lineHeight: '1.6',
+                    fontSize: '15px',
+                  }}
+                >
+                  为了获得最佳的施法视野，建议您旋转设备。
+                  <br />
+                  <span style={{ fontSize: '12px', opacity: 0.8 }}>
+                    (竖屏模式下视角可能受限)
+                  </span>
+                </p>
+
+                <button
+                  onClick={() => setDismissed(true)}
+                  style={{
+                    padding: '10px 24px',
+                    background: 'transparent',
+                    border: '1px solid #00ff88',
+                    color: '#00ff88',
+                    borderRadius: '20px',
+                    fontSize: '14px',
+                    cursor: 'pointer',
+                    outline: 'none',
+                    transition: 'all 0.2s',
+                  }}
+                  onMouseOver={(e) => {
+                    e.currentTarget.style.background = 'rgba(0, 255, 136, 0.1)';
+                  }}
+                  onMouseOut={(e) => {
+                    e.currentTarget.style.background = 'transparent';
+                  }}
+                >
+                  继续使用 &gt;
+                </button>
+              </div>
+            </React.Fragment>
+          );
         }
-      } catch (e) {}
-    }
-  }
 
-  // ---- 粒子 ----
-  particles.update(dt);
-  particles.draw(ctx);
+        return <React.Fragment>{children}</React.Fragment>;
+      }
 
-  // ---- UI ----
-  if (activeHandCount > 0) {
-    drawGestureUI();
-  } else {
-    ctx.save();
-    ctx.shadowColor = 'rgba(0,0,0,0.8)';
-    ctx.shadowBlur = 20;
-    ctx.globalAlpha = 0.2;
-    ctx.font = '20px -apple-system, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#fff';
-    ctx.fillText('🖐️ 将手伸到摄像头前', W / 2, H / 2);
-    ctx.restore();
-  }
+      // ==========================================
+      // src/App.tsx
+      // ==========================================
+      function StatusIndicator() {
+        const isTracking = useHandStore((state) => state.isTracking);
+        const gestureMode = useHandStore((state) => state.gestureMode);
+        const [errorMsg, setErrorMsg] = useState('');
 
-  // 手数
-  if (activeHandCount > 0) {
-    ctx.save();
-    ctx.globalAlpha = 0.25;
-    ctx.font = '12px -apple-system, sans-serif';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'top';
-    ctx.fillStyle = '#fff';
-    ctx.fillText(`${activeHandCount} 只手`, W - 16, 16);
-    ctx.restore();
-  }
+        useEffect(() => {
+          // 轮询检查是否有初始化错误
+          const timer = setInterval(() => {
+            if (window._handTrackingError && !errorMsg) {
+              setErrorMsg(window._handTrackingError);
+            }
+          }, 1000);
+          return () => clearInterval(timer);
+        }, [errorMsg]);
 
-  requestAnimationFrame(animate);
-}
+        if (errorMsg) {
+          return (
+            <div
+              style={{
+                position: 'fixed',
+                top: '10px',
+                left: '10px',
+                padding: '8px 16px',
+                background: 'rgba(255, 50, 50, 0.8)',
+                borderRadius: '8px',
+                color: '#fff',
+                fontSize: '12px',
+                zIndex: 100,
+                maxWidth: '300px',
+                lineHeight: '1.4',
+              }}
+            >
+              ⚠️ {errorMsg}
+            </div>
+          );
+        }
 
-// ---- 启动 ----
-async function start() {
-  try {
-    statusText.textContent = '正在请求摄像头...';
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
-    });
-    video.srcObject = stream;
-    await video.play();
-    statusText.textContent = '正在加载手势识别模型...';
-  } catch (e) {
-    statusText.textContent = '⚠️ 摄像头被拒';
-    errorMsg.textContent = '请允许摄像头权限后刷新页面';
-    errorMsg.style.display = 'block';
-    retryBtn.style.display = 'block';
-    retryBtn.onclick = () => location.reload();
-    return;
-  }
+        const getModeText = () => {
+          if (!isTracking) return '⏳ 等待手势...';
+          switch (gestureMode) {
+            case 'LOTUS':
+              return '🌸 莲花阵型';
+            case 'SHIELD':
+              return '🛡️ 护盾阵型';
+            default:
+              return '🐉 游龙阵型';
+          }
+        };
 
-  try {
-    const wasm = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
-    statusText.textContent = '加载模型（约 15MB）...';
-    const vision = await FilesetResolver.forVisionTasks(wasm);
-    handLandmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numHands: 2,
-      minHandDetectionConfidence: 0.5,
-      minHandPresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
-  } catch (e) {
-    console.error(e);
-    statusText.textContent = '⚠️ 模型加载失败';
-    errorMsg.textContent = '请检查网络连接后重试';
-    errorMsg.style.display = 'block';
-    retryBtn.style.display = 'block';
-    retryBtn.onclick = () => location.reload();
-    return;
-  }
+        const getModeColor = () => {
+          if (!isTracking) return '#ff6666';
+          switch (gestureMode) {
+            case 'LOTUS':
+              return '#ffaa44';
+            case 'SHIELD':
+              return '#88ccff';
+            default:
+              return '#00ff88';
+          }
+        };
 
-  loadingEl.classList.add('hidden');
-  setTimeout(() => { tipEl.style.opacity = '0'; }, 6000);
-  requestAnimationFrame(animate);
-}
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              top: '10px',
+              left: '10px',
+              padding: '8px 16px',
+              background: 'rgba(0, 0, 0, 0.5)',
+              borderRadius: '20px',
+              color: getModeColor(),
+              fontSize: '12px',
+              zIndex: 100,
+              transition: 'color 0.3s',
+            }}
+          >
+            {getModeText()}
+          </div>
+        );
+      }
 
-start();
-</script>
-</body>
+      function UI() {
+        const gestureMode = useHandStore((state) => state.gestureMode);
+        const isTracking = useHandStore((state) => state.isTracking);
+        const [hasError, setHasError] = useState(false);
+
+        useEffect(() => {
+          const timer = setInterval(() => {
+            if (window._handTrackingError) {
+              setHasError(true);
+            }
+          }, 1000);
+          return () => clearInterval(timer);
+        }, []);
+
+        const getColor = () => {
+          if (!isTracking) return '#00ff88';
+          switch (gestureMode) {
+            case 'LOTUS':
+              return '#ffaa44';
+            case 'SHIELD':
+              return '#88ccff';
+            default:
+              return '#00ff88';
+          }
+        };
+
+        const getHint = () => {
+          if (hasError) return '⚠️ 手势模型加载失败 (演示模式)';
+          if (!isTracking) return '👋 请挥手激活飞剑...';
+          switch (gestureMode) {
+            case 'DAGENG':
+              return '🤘 结印 · 大庚剑阵';
+            case 'LOTUS':
+              return '🖐️ 张掌 · 莲花现世';
+            case 'SHIELD':
+              return '✊ 握拳 · 剑盾护体';
+            case 'DRAGON':
+            default:
+              return '👆 剑指 · 游龙随行';
+          }
+        };
+
+        const getSubHint = () => {
+          if (hasError) {
+            return window._handTrackingError
+              ? `错误: ${window._handTrackingError.substring(0, 60)}`
+              : '请确保网络连接正常后刷新页面';
+          }
+          if (!isTracking) return '点击右上角摄像头画面启用';
+          return '改变手势切换阵型 · ✊🤘🖐️';
+        };
+
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              bottom: '30px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              textAlign: 'center',
+              zIndex: 100,
+              color: '#fff',
+              textShadow: '0 0 10px #00ff88',
+            }}
+          >
+            <h1
+              style={{
+                fontSize: '28px',
+                marginBottom: '8px',
+                color: getColor(),
+                transition: 'color 0.3s',
+              }}
+            >
+              青竹蜂云剑
+            </h1>
+            <p style={{ fontSize: '14px', opacity: 0.9 }}>{getHint()}</p>
+            <p style={{ fontSize: '11px', opacity: 0.4, marginTop: '4px' }}>{getSubHint()}</p>
+          </div>
+        );
+      }
+
+      function WebcamView() {
+        const videoRef = useRef(null);
+        const [isReady, setIsReady] = useState(false);
+        const [camError, setCamError] = useState(null);
+        const [clicked, setClicked] = useState(false);
+
+        useEffect(() => {
+          if (videoRef.current && clicked) {
+            initHandTracking(videoRef.current).then((success) => {
+              setIsReady(success);
+              if (!success && window._handTrackingError) {
+                setCamError(window._handTrackingError);
+              }
+            });
+          }
+        }, [clicked]);
+
+        if (!clicked) {
+          return (
+            <div
+              onClick={() => setClicked(true)}
+              style={{
+                position: 'fixed',
+                top: '10px',
+                right: '10px',
+                width: '160px',
+                height: '120px',
+                borderRadius: '10px',
+                background: 'rgba(0,0,0,0.55)',
+                border: '2px dashed rgba(255,255,255,0.3)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                zIndex: 100,
+                color: 'rgba(255,255,255,0.6)',
+                fontSize: '13px',
+                textAlign: 'center',
+                lineHeight: '1.4',
+                backdropFilter: 'blur(4px)',
+              }}
+            >
+              点击启用摄像头<br/>🖐️
+            </div>
+          );
+        }
+
+        const borderColor = camError
+          ? 'rgba(255,80,80,0.7)'
+          : isReady
+          ? 'rgba(0, 255, 136, 0.6)'
+          : 'rgba(255,200,50,0.6)';
+
+        return (
+          <>
+            <video
+              ref={videoRef}
+              style={{
+                position: 'fixed',
+                top: '10px',
+                right: '10px',
+                width: '160px',
+                height: '120px',
+                borderRadius: '10px',
+                border: `2px solid ${borderColor}`,
+                transform: 'scaleX(-1)',
+                objectFit: 'cover',
+                zIndex: 100,
+                background: '#000',
+              }}
+              autoPlay
+              playsInline
+              muted
+            />
+            <div
+              style={{
+                position: 'fixed',
+                top: camError ? '130px' : '130px',
+                right: '10px',
+                zIndex: 101,
+                fontSize: '11px',
+                color: camError ? '#ff6666' : isReady ? '#88ff88' : '#ffcc44',
+                background: 'rgba(0,0,0,0.6)',
+                padding: '3px 8px',
+                borderRadius: '6px',
+                textAlign: 'center',
+                maxWidth: '160px',
+                lineHeight: '1.3',
+              }}
+            >
+              {camError ? `⚠️ ${camError.substring(0, 30)}...` : isReady ? '✓ 已就绪' : '⏳ 加载模型...'}
+            </div>
+          </>
+        );
+      }
+
+      function App() {
+        return (
+          <OrientationGuard>
+            <div style={{ width: '100vw', height: '100vh' }}>
+              <WebcamView />
+
+              <Canvas
+                camera={{ position: [0, 3, 35], fov: 60 }}
+                dpr={[1, 2]}
+                gl={{ antialias: false, alpha: true }}
+              >
+                <Scene />
+                <HandController />
+              </Canvas>
+
+              <StatusIndicator />
+              <UI />
+            </div>
+          </OrientationGuard>
+        );
+      }
+
+      const root = createRoot(document.getElementById('root'));
+      root.render(
+        <React.StrictMode>
+          <App />
+        </React.StrictMode>
+      );
+    </script>
+  </body>
 </html>
