@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>手势追踪 · 幻彩粒子</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a12;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    width: 100vw; height: 100vh;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    object-fit: cover;
+  }
+  video { display: none; }
+
+  #loading {
+    position: fixed; inset: 0; z-index: 100;
+    background: #0a0a12;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    color: #fff;
+    transition: opacity 0.8s;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+  .spinner {
+    width: 48px; height: 48px;
+    border: 3px solid rgba(255,255,255,0.1);
+    border-top-color: #ff6b6b;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: 20px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading p { font-size: 15px; color: rgba(255,255,255,0.6); }
+  #loading .sub { font-size: 12px; color: rgba(255,255,255,0.3); margin-top: 8px; }
+  #loading .error-msg { font-size: 14px; color: #ff6b6b; margin-top: 12px; display: none; max-width: 320px; text-align: center; line-height: 1.5; }
+
+  #tip {
+    position: fixed; bottom: 28px; left: 50%; z-index: 50;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.35); font-size: 13px;
+    text-align: center; pointer-events: none;
+    text-shadow: 0 2px 12px rgba(0,0,0,0.8);
+    transition: opacity 2s;
+  }
+
+  #retryBtn {
+    display: none; margin-top: 16px;
+    padding: 10px 28px; border-radius: 24px;
+    background: rgba(255,255,255,0.1); color: #fff;
+    border: 1px solid rgba(255,255,255,0.2);
+    font-size: 14px; cursor: pointer;
+    transition: background 0.2s;
+  }
+  #retryBtn:hover { background: rgba(255,255,255,0.2); }
+
+  #fpsDisplay {
+    position: fixed; top: 16px; left: 16px; z-index: 50;
+    font-family: monospace; font-size: 11px;
+    color: rgba(255,255,255,0.2);
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="spinner"></div>
+  <p id="statusText">正在加载手势识别模型...</p>
+  <div class="sub">首次加载约 15MB · 请耐心等待</div>
+  <div class="error-msg" id="errorMsg"></div>
+  <button id="retryBtn">重试</button>
+</div>
+
+<div id="tip">✋ 张开 · ✊ 握拳 · ☝️ 食指 · ✌️ 剪刀 · 🤟 爱 · 🖖 四</div>
+<div id="fpsDisplay"></div>
+
+<video id="video" autoplay playsinline></video>
+<canvas id="canvas"></canvas>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm';
+
+// ---- DOM ----
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const loadingEl = document.getElementById('loading');
+const statusText = document.getElementById('statusText');
+const errorMsg = document.getElementById('errorMsg');
+const retryBtn = document.getElementById('retryBtn');
+const fpsDisplay = document.getElementById('fpsDisplay');
+const tipEl = document.getElementById('tip');
+
+// ---- 尺寸 ----
+let W, H;
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ---- 常量 ----
+const FINGERTIPS = [4, 8, 12, 16, 20];
+const FINGER_COLORS = [
+  [255, 80, 80],   // 拇指 红
+  [255, 210, 50],  // 食指 金
+  [80, 220, 120],  // 中指 绿
+  [50, 150, 255],  // 无名指 蓝
+  [180, 80, 255],  // 小指 紫
+];
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
+];
+
+// ============ 镜像坐标转换 ============
+// 摄像头画面是镜像显示（像照镜子），MediaPipe 返回的是原始坐标
+// 所以 x 坐标需要翻转：mirroredX = 1 - originalX
+function lx(lm, i) { return (1 - lm[i].x) * W; }
+function ly(lm, i) { return lm[i].y * H; }
+
+// ---- 状态 ----
+let handLandmarker = null;
+let gesture = '';
+let prevGesture = '';
+let activeHandCount = 0;
+let lastVideoTime = -1;
+let timeAcc = 0;
+
+// ---- 背景星星 ----
+class Star {
+  constructor() { this.reset(true); }
+  reset(init = false) {
+    this.x = Math.random() * W;
+    this.y = Math.random() * H;
+    this.size = 0.5 + Math.random() * 1.5;
+    this.speed = 0.1 + Math.random() * 0.3;
+    this.alpha = 0.2 + Math.random() * 0.5;
+    this.phase = Math.random() * Math.PI * 2;
+    if (!init) this.y = -2;
+  }
+  update() {
+    this.y += this.speed;
+    if (this.y > H + 2) this.reset();
+  }
+  draw(ctx, time) {
+    const flicker = this.alpha * (0.6 + 0.4 * Math.sin(time * 0.02 + this.phase));
+    ctx.save();
+    ctx.globalAlpha = flicker;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+const stars = Array.from({ length: 80 }, () => new Star());
+
+// ---- 背景光晕 ----
+let bgHue = 220;
+function drawBackground(gestureColor) {
+  // 深色渐变背景
+  const grad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W, H) * 0.8);
+  grad.addColorStop(0, '#12121f');
+  grad.addColorStop(1, '#080814');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // 星星
+  for (const s of stars) { s.update(); s.draw(ctx, timeAcc); }
+
+  // 手势色背景辉光（动态）
+  if (gestureColor) {
+    const [r, g, b] = gestureColor;
+    const cx = W/2 + Math.sin(timeAcc * 0.003) * W * 0.2;
+    const cy = H/2 + Math.cos(timeAcc * 0.004) * H * 0.15;
+    const glow = ctx.createRadialGradient(cx, cy, 20, cx, cy, Math.max(W, H) * 0.45);
+    glow.addColorStop(0, `rgba(${r},${g},${b},0.06)`);
+    glow.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // 边缘光晕
+  const edgePhase = Math.sin(timeAcc * 0.01) * 0.5 + 0.5;
+  const eg = ctx.createRadialGradient(W/2, H/2, Math.max(W, H) * 0.25, W/2, H/2, Math.max(W, H) * 0.55);
+  eg.addColorStop(0, 'rgba(0,0,0,0)');
+  eg.addColorStop(1, `rgba(30, 40, 80, ${0.1 + edgePhase * 0.08})`);
+  ctx.fillStyle = eg;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ---- 粒子系统（重写，更华丽） ----
+class Particle {
+  constructor(x, y, color, opts = {}) {
+    this.x = x; this.y = y;
+    const angle = opts.angle !== undefined ? opts.angle : -Math.PI/2 + (Math.random() - 0.5) * (opts.spread || 1.2);
+    const speed = opts.speed !== undefined ? opts.speed : 1 + Math.random() * 4;
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+    this.life = 1;
+    this.maxLife = opts.maxLife !== undefined ? opts.maxLife : 0.8 + Math.random() * 1.8;
+    this.size = opts.size !== undefined ? opts.size : 1.5 + Math.random() * 5;
+    this.color = color;
+    this.gravity = opts.gravity !== undefined ? opts.gravity : 0.005;
+    this.friction = opts.friction !== undefined ? opts.friction : 0.97;
+    this.trail = []; // 轨迹
+    this.trailLen = opts.trailLen || 0;
+    this.glowMult = opts.glowMult !== undefined ? opts.glowMult : 1;
+    this.shape = opts.shape || 'circle'; // circle | star
+  }
+  update(dt) {
+    if (this.trailLen > 0) {
+      this.trail.push({ x: this.x, y: this.y });
+      if (this.trail.length > this.trailLen) this.trail.shift();
+    }
+    this.life -= dt / (this.maxLife * 60);
+    this.vx *= this.friction;
+    this.vy *= this.friction;
+    this.vy += this.gravity;
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+  }
+  get alive() { return this.life > 0; }
+  get alpha() { return Math.min(1, this.life * 2.5); }
+  get currentSize() { return this.size * Math.min(1, this.life * 2); }
+}
+
+class ParticleSystem {
+  constructor() {
+    this.particles = [];
+  }
+  emit(x, y, color, count = 3, spread = 1.0, opts = {}) {
+    for (let i = 0; i < count; i++) {
+      this.particles.push(new Particle(x, y, color, { ...opts, spread }));
+    }
+  }
+  burst(x, y, color, count = 30, power = 7, opts = {}) {
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1 + Math.random() * power;
+      this.particles.push(new Particle(x, y, color, {
+        ...opts, angle, speed: speed,
+        maxLife: 0.6 + Math.random() * 1.0,
+        friction: 0.96,
+      }));
+    }
+  }
+  implode(x, y, color, count = 25) {
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 0.5 + Math.random() * 2;
+      this.particles.push(new Particle(x, y, color, {
+        angle, speed: speed,
+        vx: Math.cos(angle) * speed * -0.8,
+        vy: Math.sin(angle) * speed * -0.8,
+        maxLife: 1.2 + Math.random() * 1.2,
+        friction: 0.90, gravity: 0.002,
+        glowMult: 1.5,
+      }));
+    }
+  }
+  ring(x, y, color, count = 24) {
+    for (let i = 0; i < count; i++) {
+      const angle = (i / count) * Math.PI * 2;
+      const speed = 2 + Math.random() * 1.5;
+      this.particles.push(new Particle(x, y, color, {
+        angle, speed,
+        maxLife: 0.5 + Math.random() * 0.3,
+        friction: 0.98, gravity: 0,
+        size: 2 + Math.random() * 3,
+        glowMult: 2,
+      }));
+    }
+  }
+  spiral(x, y, color, count = 36) {
+    for (let i = 0; i < count; i++) {
+      const t = i / count;
+      const angle = t * Math.PI * 4;
+      const speed = 1 + t * 4;
+      this.particles.push(new Particle(x, y, color, {
+        angle, speed,
+        maxLife: 0.6 + t * 0.6,
+        friction: 0.97, gravity: 0,
+        size: 2 + t * 3,
+        glowMult: 1.5 + t,
+      }));
+    }
+  }
+  update(dt) {
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      this.particles[i].update(dt);
+      if (!this.particles[i].alive) this.particles.splice(i, 1);
+    }
+    if (this.particles.length > 4000) {
+      this.particles.splice(0, this.particles.length - 4000);
+    }
+  }
+  draw(ctx) {
+    // 先画轨迹
+    for (const p of this.particles) {
+      if (p.trail.length < 2) continue;
+      const [r, g, b] = p.color;
+      ctx.save();
+      ctx.globalAlpha = p.alpha * 0.2;
+      ctx.shadowColor = `rgb(${r},${g},${b})`;
+      ctx.shadowBlur = 8;
+      ctx.strokeStyle = `rgba(${r},${g},${b},${p.alpha * 0.3})`;
+      ctx.lineWidth = p.size * 0.3;
+      ctx.beginPath();
+      ctx.moveTo(p.trail[0].x, p.trail[0].y);
+      for (let k = 1; k < p.trail.length; k++) {
+        ctx.lineTo(p.trail[k].x, p.trail[k].y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 再画粒子
+    for (const p of this.particles) {
+      const alpha = p.alpha;
+      const size = p.currentSize;
+      if (alpha < 0.01 || size < 0.1) continue;
+      const [r, g, b] = p.color;
+
+      // 外发光层
+      ctx.save();
+      ctx.globalAlpha = alpha * 0.3 * p.glowMult;
+      ctx.shadowColor = `rgb(${r},${g},${b})`;
+      ctx.shadowBlur = size * 6 * p.glowMult;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, size * 0.7, 0, Math.PI * 2);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fill();
+      ctx.restore();
+
+      // 核心
+      ctx.save();
+      ctx.globalAlpha = alpha * 0.9;
+      ctx.shadowColor = `rgb(${r},${g},${b})`;
+      ctx.shadowBlur = size * 4;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, size * 0.45, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,255,255,${alpha * 0.85})`;
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+const particles = new ParticleSystem();
+
+// ---- 指尖拖尾系统 ----
+class TrailPoint {
+  constructor(x, y, color) {
+    this.x = x; this.y = y; this.color = color;
+    this.life = 1;
+  }
+}
+
+let fingertipTrails = {};
+
+function updateFingertipTrails(lm) {
+  const now = performance.now();
+  for (let f = 0; f < FINGERTIPS.length; f++) {
+    const idx = FINGERTIPS[f];
+    const x = lx(lm, idx);
+    const y = ly(lm, idx);
+    const key = f;
+    if (!fingertipTrails[key]) fingertipTrails[key] = [];
+    fingertipTrails[key].unshift({ x, y, life: 1, color: FINGER_COLORS[f] });
+    if (fingertipTrails[key].length > 12) fingertipTrails[key].pop();
+  }
+}
+
+function drawFingertipTrails(ctx) {
+  for (const key in fingertipTrails) {
+    const trail = fingertipTrails[key];
+    if (trail.length < 2) continue;
+    const [r, g, b] = trail[0].color;
+    for (let i = 0; i < trail.length - 1; i++) {
+      const p = trail[i];
+      const alpha = (1 - i / trail.length) * 0.5;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.shadowColor = `rgb(${r},${g},${b})`;
+      ctx.shadowBlur = 15;
+      ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+      ctx.lineWidth = 3 - (i / trail.length) * 2.5;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(trail[i+1].x, trail[i+1].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// ---- 手势检测 ----
+function isFingerUp(lm, tip, pip, isThumb = false) {
+  if (isThumb) {
+    const dx = lm[tip].x - lm[5].x;
+    const dy = lm[tip].y - lm[5].y;
+    const dTip = Math.sqrt(dx*dx + dy*dy);
+    const dx2 = lm[pip].x - lm[5].x;
+    const dy2 = lm[pip].y - lm[5].y;
+    const dPip = Math.sqrt(dx2*dx2 + dy2*dy2);
+    if (dPip === 0) return false;
+    return dTip > dPip * 1.1;
+  }
+  return lm[tip].y < lm[pip].y;
+}
+
+function detectGesture(lm) {
+  const up = [
+    isFingerUp(lm, 4, 3, true),
+    isFingerUp(lm, 8, 6),
+    isFingerUp(lm, 12, 10),
+    isFingerUp(lm, 16, 14),
+    isFingerUp(lm, 20, 18),
+  ];
+  const count = up.filter(Boolean).length;
+  if (count === 0) return 'FIST';
+  if (count === 5) return 'OPEN';
+  if (count === 1 && up[1]) return 'POINT';
+  if (count === 2 && up[1] && up[2]) return 'PEACE';
+  if (count === 3 && up[1] && up[2] && up[3]) return 'THREE';
+  if (count === 4 && !up[0]) return 'FOUR';
+  return 'OPEN';
+}
+
+function gestureLabel(g) {
+  const map = { 'FIST':'✊ 握拳','OPEN':'✋ 张开','POINT':'☝️ 食指','PEACE':'✌️ 剪刀','THREE':'🤟 爱','FOUR':'🖖 四指' };
+  return map[g] || g;
+}
+
+function gestureColor(g) {
+  const map = { 'FIST':[255,50,80],'OPEN':[50,200,255],'POINT':[255,210,50],'PEACE':[80,255,150],'THREE':[200,100,255],'FOUR':[255,180,60] };
+  return map[g] || [80,180,255];
+}
+
+// ---- 渲染骨架（使用镜像坐标） ----
+function drawSkeleton(lm) {
+  // 连接线 - 发光
+  for (const [i, j] of HAND_CONNECTIONS) {
+    const x1 = lx(lm, i), y1 = ly(lm, i);
+    const x2 = lx(lm, j), y2 = ly(lm, j);
+    ctx.save();
+    ctx.shadowColor = 'rgba(100,200,255,0.4)';
+    ctx.shadowBlur = 6;
+    ctx.strokeStyle = 'rgba(150,220,255,0.3)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 关节点
+  for (let i = 0; i < lm.length; i++) {
+    const x = lx(lm, i), y = ly(lm, i);
+    const isTip = FINGERTIPS.includes(i);
+    const idx = FINGERTIPS.indexOf(i);
+    const [r, g, b] = idx >= 0 ? FINGER_COLORS[idx] : [80, 180, 255];
+    const size = isTip ? 5 : 2.5;
+
+    if (isTip) {
+      // 指尖大光环
+      ctx.save();
+      ctx.shadowColor = `rgb(${r},${g},${b})`;
+      ctx.shadowBlur = 30;
+      ctx.beginPath();
+      ctx.arc(x, y, size + 2, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${r},${g},${b},0.3)`;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.shadowColor = `rgb(${r},${g},${b})`;
+    ctx.shadowBlur = isTip ? 20 : 8;
+    ctx.beginPath();
+    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.fillStyle = isTip ? `rgb(${r},${g},${b})` : 'rgba(180,220,255,0.5)';
+    ctx.fill();
+    ctx.restore();
+
+    if (isTip) {
+      ctx.save();
+      ctx.shadowBlur = 0;
+      ctx.beginPath();
+      ctx.arc(x, y, size * 0.35, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+// ---- 手势变化特效 ----
+function onGestureChange(newGesture, lm) {
+  if (newGesture === prevGesture) return;
+  prevGesture = newGesture;
+
+  const cx = (lx(lm, 5) + lx(lm, 9) + lx(lm, 13) + lx(lm, 17)) / 4;
+  const cy = (ly(lm, 5) + ly(lm, 9) + ly(lm, 13) + ly(lm, 17)) / 4;
+  const color = gestureColor(newGesture);
+
+  // 组合特效
+  switch (newGesture) {
+    case 'FIST':
+      particles.implode(cx, cy, [255, 60, 80], 35);
+      particles.ring(cx, cy, [255, 100, 120], 20);
+      break;
+    case 'OPEN':
+      particles.burst(cx, cy, [60, 200, 255], 50, 10, { glowMult: 1.5 });
+      particles.spiral(cx, cy, [100, 220, 255], 30);
+      break;
+    case 'POINT':
+      particles.burst(cx, cy, [255, 220, 50], 30, 6);
+      particles.ring(cx, cy, [255, 200, 80], 16);
+      break;
+    case 'PEACE':
+      particles.burst(cx, cy, [80, 255, 150], 40, 8, { glowMult: 1.3 });
+      particles.spiral(cx, cy, [120, 255, 180], 24);
+      break;
+    case 'THREE':
+      particles.burst(cx, cy, [200, 100, 255], 45, 9, { glowMult: 1.4 });
+      particles.ring(cx, cy, [220, 140, 255], 24);
+      break;
+    case 'FOUR':
+      particles.burst(cx, cy, [255, 180, 60], 40, 8);
+      particles.spiral(cx, cy, [255, 200, 100], 24);
+      break;
+  }
+}
+
+// ---- 绘制手势UI ----
+function drawGestureUI() {
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.8)';
+  ctx.shadowBlur = 20;
+
+  const label = gestureLabel(gesture);
+  ctx.font = '600 44px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#fff';
+  ctx.globalAlpha = 0.85;
+  ctx.fillText(label, W / 2, 42);
+
+  ctx.globalAlpha = 0.2;
+  ctx.font = '13px -apple-system, sans-serif';
+  ctx.fillText('手势追踪 · 粒子幻境', W / 2, 96);
+
+  ctx.restore();
+}
+
+// ---- 主循环 ----
+let lastTime = 0;
+let frameCount = 0;
+let fps = 0;
+let fpsTimer = 0;
+
+function animate(time) {
+  const dt = lastTime ? Math.min((time - lastTime) / 16.667, 3) : 1;
+  lastTime = time;
+  timeAcc += dt;
+
+  // FPS
+  frameCount++;
+  fpsTimer += dt;
+  if (fpsTimer >= 60) {
+    fps = Math.round(frameCount / (fpsTimer / 60));
+    frameCount = 0; fpsTimer = 0;
+    fpsDisplay.textContent = `${fps} fps`;
+  }
+
+  // ---- 背景（无摄像头画面） ----
+  drawBackground(gesture ? gestureColor(gesture) : null);
+
+  // ---- MediaPipe 检测 ----
+  if (handLandmarker && video.readyState >= 2) {
+    const now = performance.now();
+    if (video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      try {
+        const result = handLandmarker.detectForVideo(video, now);
+        const hands = result.landmarks;
+        activeHandCount = hands ? hands.length : 0;
+
+        if (hands) {
+          for (let h = 0; h < hands.length; h++) {
+            const lm = hands[h];
+
+            // 拖尾
+            updateFingertipTrails(lm);
+
+            const newGesture = detectGesture(lm);
+            if (newGesture !== gesture) {
+              gesture = newGesture;
+              onGestureChange(gesture, lm);
+            }
+
+            // 指尖粒子发射
+            for (let f = 0; f < FINGERTIPS.length; f++) {
+              const x = lx(lm, FINGERTIPS[f]);
+              const y = ly(lm, FINGERTIPS[f]);
+              const color = FINGER_COLORS[f];
+
+              let emitCount = 0, spread = 1.0, opts = {};
+              if (gesture === 'FIST') emitCount = 0;
+              else if (gesture === 'POINT') {
+                if (f === 1) { emitCount = 6; spread = 0.1; opts.trailLen = 5; }
+                else emitCount = 0;
+              } else if (gesture === 'PEACE') {
+                if (f === 1 || f === 2) { emitCount = 5; spread = 0.2; opts.trailLen = 4; }
+                else emitCount = 0;
+              } else if (gesture === 'THREE') {
+                if (f >= 1 && f <= 3) { emitCount = 4; spread = 0.3; opts.trailLen = 3; }
+                else emitCount = 0;
+              } else if (gesture === 'FOUR') {
+                if (f >= 1) { emitCount = 3; spread = 0.4; }
+                else emitCount = 0;
+              } else {
+                emitCount = 3;
+                spread = 1.4;
+                opts.trailLen = 3;
+              }
+
+              if (emitCount > 0) particles.emit(x, y, color, emitCount, spread, opts);
+            }
+
+            // 画骨架
+            drawSkeleton(lm);
+          }
+
+          // 画指尖拖尾
+          drawFingertipTrails(ctx);
+        }
+      } catch (e) {}
+    }
+  }
+
+  // ---- 粒子 ----
+  particles.update(dt);
+  particles.draw(ctx);
+
+  // ---- UI ----
+  if (activeHandCount > 0) {
+    drawGestureUI();
+  } else {
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.8)';
+    ctx.shadowBlur = 20;
+    ctx.globalAlpha = 0.2;
+    ctx.font = '20px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('🖐️ 将手伸到摄像头前', W / 2, H / 2);
+    ctx.restore();
+  }
+
+  // 手数
+  if (activeHandCount > 0) {
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.font = '12px -apple-system, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`${activeHandCount} 只手`, W - 16, 16);
+    ctx.restore();
+  }
+
+  requestAnimationFrame(animate);
+}
+
+// ---- 启动 ----
+async function start() {
+  try {
+    statusText.textContent = '正在请求摄像头...';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    await video.play();
+    statusText.textContent = '正在加载手势识别模型...';
+  } catch (e) {
+    statusText.textContent = '⚠️ 摄像头被拒';
+    errorMsg.textContent = '请允许摄像头权限后刷新页面';
+    errorMsg.style.display = 'block';
+    retryBtn.style.display = 'block';
+    retryBtn.onclick = () => location.reload();
+    return;
+  }
+
+  try {
+    const wasm = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
+    statusText.textContent = '加载模型（约 15MB）...';
+    const vision = await FilesetResolver.forVisionTasks(wasm);
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+  } catch (e) {
+    console.error(e);
+    statusText.textContent = '⚠️ 模型加载失败';
+    errorMsg.textContent = '请检查网络连接后重试';
+    errorMsg.style.display = 'block';
+    retryBtn.style.display = 'block';
+    retryBtn.onclick = () => location.reload();
+    return;
+  }
+
+  loadingEl.classList.add('hidden');
+  setTimeout(() => { tipEl.style.opacity = '0'; }, 6000);
+  requestAnimationFrame(animate);
+}
+
+start();
+</script>
+</body>
+</html>
