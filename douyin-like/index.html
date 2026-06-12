@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>抖音点赞</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: #1a1a2e;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    user-select: none;
+  }
+  .phone {
+    width: 390px;
+    height: 750px;
+    background: #000;
+    border-radius: 40px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.6), 0 0 0 2px #333;
+  }
+  /* 内容区域 */
+  .content {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+    position: relative;
+  }
+  /* 装饰渐变背景 */
+  .bg-glow {
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(circle at 60% 40%, rgba(255,50,100,0.15), transparent 60%),
+                radial-gradient(circle at 30% 70%, rgba(100,50,255,0.1), transparent 50%);
+    pointer-events: none;
+  }
+  /* 视频模拟区域 */
+  .video-area {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .video-area .placeholder-icon {
+    font-size: 80px;
+    opacity: 0.08;
+    color: #fff;
+  }
+  /* 底部信息 */
+  .bottom-info {
+    position: relative;
+    z-index: 10;
+    padding: 24px 16px 30px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.7) 40%);
+  }
+  .user-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #ff6b6b, #ffd93d);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    color: #fff;
+    font-size: 18px;
+    border: 2px solid rgba(255,255,255,0.3);
+  }
+  .username {
+    color: #fff;
+    font-weight: 600;
+    font-size: 16px;
+  }
+  .desc {
+    color: rgba(255,255,255,0.8);
+    font-size: 14px;
+    line-height: 1.5;
+    margin-bottom: 6px;
+  }
+  .desc .tag {
+    color: #8cf;
+  }
+  /* 右侧操作按钮 */
+  .actions {
+    position: absolute;
+    right: 12px;
+    bottom: 140px;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+  }
+  .action-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    position: relative;
+  }
+  .action-btn .icon-wrap {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.1);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s;
+    font-size: 24px;
+  }
+  .action-btn:active .icon-wrap {
+    transform: scale(0.85);
+  }
+  .action-btn .count {
+    color: rgba(255,255,255,0.85);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  /* 点赞按钮专用 */
+  .like-btn .icon-wrap {
+    font-size: 28px;
+  }
+  .like-btn.liked .icon-wrap {
+    color: #ff3040;
+  }
+  /* 爱心动画容器 */
+  .hearts-container {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: 0;
+    pointer-events: none;
+    z-index: 15;
+    overflow: hidden;
+  }
+  /* 飘出的爱心 */
+  .heart-emoji {
+    position: absolute;
+    font-size: 48px;
+    will-change: transform, opacity;
+    pointer-events: none;
+  }
+  /* 双击提示的爱心 */
+  .double-tap-heart {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    font-size: 120px;
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0;
+    pointer-events: none;
+    z-index: 20;
+    transition: none;
+  }
+  .double-tap-heart.show {
+    animation: heartPop 0.8s ease-out forwards;
+  }
+  @keyframes heartPop {
+    0% { transform: translate(-50%, -50%) scale(0); opacity: 1; }
+    30% { transform: translate(-50%, -50%) scale(1.2); opacity: 1; }
+    60% { transform: translate(-50%, -50%) scale(0.95); opacity: 1; }
+    100% { transform: translate(-50%, -50%) scale(1); opacity: 0; }
+  }
+  /* 顶部状态栏 */
+  .status-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 30;
+    padding: 12px 20px 8px;
+    display: flex;
+    justify-content: space-between;
+    color: white;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  /* 响应式 */
+  @media (max-width: 420px) {
+    .phone { width: 100vw; height: 100vh; border-radius: 0; box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="phone" id="app">
+  <div class="status-bar">
+    <span>9:41</span>
+    <span>📶 🔋</span>
+  </div>
+
+  <div class="content" id="mainContent">
+    <div class="bg-glow"></div>
+
+    <div class="video-area">
+      <div class="placeholder-icon">🎵</div>
+    </div>
+
+    <!-- 双击大爱心 -->
+    <div class="double-tap-heart" id="bigHeart">❤️</div>
+
+    <!-- 爱心动画 -->
+    <div class="hearts-container" id="heartsContainer"></div>
+
+    <!-- 右侧操作 -->
+    <div class="actions">
+      <!-- 点赞 -->
+      <div class="action-btn like-btn" id="likeBtn">
+        <div class="icon-wrap" id="likeIcon">🤍</div>
+        <span class="count" id="likeCount">0</span>
+      </div>
+      <!-- 评论 -->
+      <div class="action-btn" id="commentBtn">
+        <div class="icon-wrap">💬</div>
+        <span class="count">0</span>
+      </div>
+      <!-- 分享 -->
+      <div class="action-btn" id="shareBtn">
+        <div class="icon-wrap">↗️</div>
+        <span class="count">分享</span>
+      </div>
+    </div>
+
+    <!-- 底部信息 -->
+    <div class="bottom-info">
+      <div class="user-row">
+        <div class="avatar">抖</div>
+        <span class="username">@douyin_demo</span>
+      </div>
+      <div class="desc">
+        双击屏幕点赞 ❤️ · 点击右下角❤️也可以哦！
+        <br><span class="tag">#抖音点赞 #demo</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  // ---- 状态 ----
+  let liked = false;
+  let likeCount = 0;
+  let lastTapTime = 0;
+  let isProcessingDoubleTap = false;
+
+  const app = document.getElementById('app');
+  const likeBtn = document.getElementById('likeBtn');
+  const likeIcon = document.getElementById('likeIcon');
+  const likeCountEl = document.getElementById('likeCount');
+  const heartsContainer = document.getElementById('heartsContainer');
+  const bigHeart = document.getElementById('bigHeart');
+  const mainContent = document.getElementById('mainContent');
+
+  // ---- 辅助 ----
+  function formatCount(n) {
+    if (n >= 10000) return (n / 10000).toFixed(1) + 'w';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  // ---- 飘出小爱心 ----
+  const heartEmojis = ['❤️', '💖', '💗', '💕', '❤️‍🔥', '♥️'];
+  function spawnFloatingHeart(x, y) {
+    const el = document.createElement('div');
+    el.className = 'heart-emoji';
+    el.textContent = heartEmojis[Math.floor(Math.random() * heartEmojis.length)];
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+    const size = 28 + Math.random() * 32;
+    el.style.fontSize = size + 'px';
+    heartsContainer.appendChild(el);
+
+    // 随机飘向
+    const angle = -60 + Math.random() * 120; // 向上偏左右
+    const rad = angle * Math.PI / 180;
+    const dist = 120 + Math.random() * 100;
+    const dx = Math.cos(rad) * dist;
+    const dy = Math.sin(rad) * dist - 150 - Math.random() * 80;
+    const dur = 900 + Math.random() * 600;
+
+    el.animate([
+      { transform: 'translate(0,0) scale(0)', opacity: 1 },
+      { transform: `translate(${dx*0.3}px, ${dy*0.4}px) scale(1.1)`, opacity: 1, offset: 0.2 },
+      { transform: `translate(${dx*0.7}px, ${dy*0.7}px) scale(1)`, opacity: 0.7, offset: 0.6 },
+      { transform: `translate(${dx}px, ${dy}px) scale(0.6)`, opacity: 0 },
+    ], {
+      duration: dur,
+      easing: 'ease-out',
+      fill: 'forwards',
+    }).onfinish = () => el.remove();
+  }
+
+  function spawnMultipleHearts(count) {
+    const rect = mainContent.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    for (let i = 0; i < count; i++) {
+      const offsetX = (Math.random() - 0.5) * 60;
+      const offsetY = (Math.random() - 0.5) * 40;
+      spawnFloatingHeart(cx + offsetX, cy + offsetY);
+    }
+  }
+
+  // ---- 双击大爱心 ----
+  function showBigHeart() {
+    bigHeart.classList.remove('show');
+    void bigHeart.offsetWidth; // 强制回流重置动画
+    bigHeart.classList.add('show');
+    setTimeout(() => bigHeart.classList.remove('show'), 900);
+  }
+
+  // ---- 切换点赞 ----
+  function setLike(val) {
+    if (liked === val) return;
+    liked = val;
+    if (liked) {
+      likeCount++;
+      likeIcon.textContent = '❤️';
+      likeBtn.classList.add('liked');
+      showBigHeart();
+      spawnMultipleHearts(5 + Math.floor(Math.random() * 4));
+    } else {
+      likeCount = Math.max(0, likeCount - 1);
+      likeIcon.textContent = '🤍';
+      likeBtn.classList.remove('liked');
+    }
+    likeCountEl.textContent = formatCount(likeCount);
+  }
+
+  // 点赞 + 飘心
+  function doLike() {
+    if (liked) return;
+    setLike(true);
+  }
+
+  // ---- 事件 ----
+  // 1. 双击
+  mainContent.addEventListener('click', function(e) {
+    const now = Date.now();
+    if (now - lastTapTime < 400) {
+      // 双击
+      doLike();
+      lastTapTime = 0;
+      e.preventDefault();
+      return;
+    }
+    lastTapTime = now;
+  });
+
+  // 2. 点赞按钮
+  likeBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    setLike(!liked);
+  });
+
+  // 3. 评论/分享模拟
+  document.getElementById('commentBtn').addEventListener('click', function(e) {
+    e.stopPropagation();
+    alert('💬 评论功能已打开 (模拟)');
+  });
+  document.getElementById('shareBtn').addEventListener('click', function(e) {
+    e.stopPropagation();
+    alert('↗️ 分享功能已打开 (模拟)');
+  });
+
+  // ---- 初始化随机点赞数 ----
+  likeCount = Math.floor(Math.random() * 5000) + 2000;
+  likeCountEl.textContent = formatCount(likeCount);
+})();
+</script>
+</body>
+</html>
